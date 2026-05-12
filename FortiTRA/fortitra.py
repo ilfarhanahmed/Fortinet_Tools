@@ -1,6 +1,8 @@
 # !/usr/bin/env python3
 """
 FortiManager TAC Report Health Check Tool
+by Farhan Ahmed - ETAC-AMER
+
 Parses a FortiManager console_history / TAC report file and checks:
   - System identity (platform, version, serial, hostname)
   - VM license expiry  (diag debug vminfo)
