@@ -1,58 +1,58 @@
 # !/usr/bin/env python3
 """
-FortiManager TAC Report Health Check Tool
+FortiManager / FortiAnalyzer TAC Report Health Check Tool
 by Farhan Ahmed - ETAC-AMER
 
-Parses a FortiManager console_history / TAC report file and checks:
-  - System identity (platform, version, serial, hostname)
-  - VM license expiry  (diag debug vminfo)
-  - CPU count and usage  (diag system print cpuinfo / get system performance)
-  - RAM total and usage  (Memory info / get system performance)
-  - Disk total and usage  (get system performance)
-  - Sizing adequacy vs Fortinet minimum requirements
-  - Device/VDOM count and list  (diag dvm device list)
-  - Policy package install status per device
-  - NTP status  (diag system ntp status)
-  - HA mode  (get system ha)
-  - Crash log presence  (diag debug crashlog read / event log)
-  - Klog check (dia de klog)
-  - Downgrade check (dia cdb upgrade summary)
-  - ADOM list  (diag dvm adom list)
-  - Task history  (task/task)
-  - Flash disk usage
-
-Sizing reference:
-  https://docs.fortinet.com/document/fortimanager-private-cloud/7.6.0/
-          kvm-administration-guide/583600/minimum-system-requirements
-  Absolute minimum: 4 vCPU, 16 GB RAM (7.4.1+), 500 GB disk
-  Per-scale requirements (max devices/VDOMs -> RAM GB, CPU cores):
-    100   ->  16 GB,  4 cores
-    300   ->  16 GB,  6 cores
-    1200  ->  32 GB,  6 cores
-    4000  ->  64 GB, 16 cores
-    10000 -> 128 GB, 24 cores
-
+Checks:
+  - System Status
+  - VM License
+  - Resource Performance
+  - Sizing Adequacy
+  - CDB Upgrade History
+  - FDS Sizing (FMG only)
+  - FAZ Log Rate and Sizing (FAZ only)
+  - Kernel Log (OOM / fsck)
 """
 
 import re
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
-# Fortinet official sizing table (FMG 7.6, KVM guide)
-# (max_devices_vdoms, min_ram_gb, min_cpu_cores)
-# Absolute floor regardless of device count: 4 CPU, 16 GB RAM, 500 GB disk
+# Fortinet sizing tables
 # ---------------------------------------------------------------------------
-SIZING_TABLE = [
-    (100, 16, 4),
-    (300, 16, 6),
-    (1200, 32, 6),
-    (4000, 64, 16),
+
+# FMG VM sizing (KVM guide 7.6)
+# (max_devices_vdoms, min_ram_gb, min_cpu_cores)
+FMG_SIZING_TABLE = [
+    (100,   16,  4),
+    (300,   16,  6),
+    (1200,  32,  6),
+    (4000,  64, 16),
     (10000, 128, 24),
 ]
-ABS_MIN_CPU = 4
-ABS_MIN_RAM_GB = 16
-ABS_MIN_DISK_GB = 500
+FMG_ABS_MIN_CPU     = 4
+FMG_ABS_MIN_RAM_GB  = 16
+FMG_ABS_MIN_DISK_GB = 500
+
+# FAZ VM sizing (KVM guide 8.0)
+# (analytic_rate, min_ram_gb, min_cpu, min_iops)
+FAZ_SIZING_TABLE = [
+    ( 3000, 16,  4,   300),
+    ( 4000, 16,  4,   400),
+    ( 5000, 16,  4,   500),
+    ( 6000, 16,  8,   600),
+    ( 7000, 16,  8,   700),
+    ( 8000, 16,  8,   800),
+    ( 9000, 16,  8,   900),
+    (10000, 16,  8,  1000),
+    (20000, 32, 16,  2000),
+    (30000, 32, 16,  3000),
+    (40000, 64, 32,  4000),
+    (50000, 64, 32,  5000),
+]
+
 DISK_WARN_PCT = 75
 DISK_CRIT_PCT = 90
 
@@ -69,14 +69,8 @@ def section(title):
 
 
 def ok(msg):   print(f"  [OK  ] {msg}")
-
-
 def warn(msg): print(f"  [WARN] {msg}")
-
-
 def crit(msg): print(f"  [CRIT] {msg}")
-
-
 def info(msg): print(f"  [INFO] {msg}")
 
 
@@ -93,18 +87,35 @@ def load(path: str) -> str:
 
 
 def section_text(text: str, start_marker: str, end_marker: str = "### ") -> str:
-    """Return the text between start_marker and the next ### section."""
     idx = text.find(start_marker)
     if idx == -1:
         return ""
     start = idx + len(start_marker)
-    end = text.find(end_marker, start)
+    end   = text.find(end_marker, start)
     return text[start:end].strip() if end != -1 else text[start:].strip()
 
 
 def first_match(pattern: str, text: str, flags=0):
     m = re.search(pattern, text, flags)
     return m.group(1).strip() if m else None
+
+
+def _parse_kb(s: str) -> float:
+    s = str(s).replace(",", "").replace(" KB", "").replace("KB", "").strip()
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _parse_version(ver_str: str):
+    m = re.search(r"v?(\d+)\.(\d+)\.(\d+)-build(\d+)", ver_str)
+    if m:
+        return tuple(int(x) for x in m.groups())
+    m = re.search(r"v?(\d+)\.(\d+)\.(\d+)", ver_str)
+    if m:
+        return tuple(int(x) for x in m.groups()) + (0,)
+    return None
 
 
 # ------------------
@@ -116,15 +127,17 @@ def check_system_status(text: str):
     block = section_text(text, "### get system status")
 
     fields = {
-        "Platform Full Name": "Platform",
-        "Version": "Version",
-        "Serial Number": "Serial",
-        "Hostname": "Hostname",
-        "HA Mode": "HA Mode",
-        "FIPS Mode": "FIPS Mode",
-        "Disk Usage": "Disk Usage",
-        "License Status": "License",
-        "Image Signature": "Image Signature",
+        "Platform Full Name":           "Platform",
+        "Version":                      "Version",
+        "Serial Number":                "Serial",
+        "Hostname":                     "Hostname",
+        "HA Mode":                      "HA Mode",
+        "Disk Usage":                   "Disk Usage",
+        "License Status":               "License",
+        "Image Signature":              "Image Signature",
+        "Admin Domain Configuration":   "ADOM Config",
+        "Max Number of Admin Domains":  "Max ADOMs",
+        "FIPS Mode":                    "FIPS Mode",
     }
     for key, label in fields.items():
         val = first_match(rf"^{re.escape(key)}\s*:\s*(.+)$", block, re.MULTILINE)
@@ -135,31 +148,36 @@ def check_system_status(text: str):
             (ok if val == "Valid" else crit)(f"{label}: {val}")
         elif key == "Image Signature":
             (ok if "GA Certified" in val else warn)(f"{label}: {val}")
+        elif key == "FIPS Mode":
+            (ok if val.lower() == "enabled" else warn)(f"{label}: {val}")
+        elif key == "Admin Domain Configuration":
+            (ok if val.lower() == "enabled" else warn)(f"{label}: {val}")
         else:
             info(f"{label}: {val}")
 
 
 def check_vm_license(text: str):
     section("VM License")
-    block = section_text(text, "### diag debug vminfo")
 
-    valid = "VM license is valid" in block
+    status_block  = section_text(text, "### get system status")
+    platform_type = first_match(r"^Platform Type\s*:\s*(.+)$", status_block, re.MULTILINE) or ""
+    if "-VM" not in platform_type.upper():
+        info("Hardware appliance — VM license check not applicable")
+        info("License status is shown under System Status")
+        return
+
+    block   = section_text(text, "### diag debug vminfo")
+    valid   = "VM license is valid" in block
     expires = first_match(r"Expires in\s*:\s*(.+)", block)
     vm_type = first_match(r"^Type\s*:\s*(.+)$", block, re.MULTILINE)
     max_dev = first_match(r"^Max devices\s*:\s*(.+)$", block, re.MULTILINE)
 
-    if valid:
-        ok("License: valid")
-    else:
-        crit("License: NOT valid or status not found")
+    (ok if valid else crit)("License: valid" if valid else "License: NOT valid or status not found")
 
     if expires:
-        # Warn if expiring soon (contains "days" and number <= 30)
         day_match = re.search(r"(\d+)\s*day", expires)
         days = int(day_match.group(1)) if day_match else 999
-        (crit if days <= 7 else warn if days <= 30 else ok)(
-            f"Expires in: {expires}"
-        )
+        (crit if days <= 7 else warn if days <= 30 else ok)(f"Expires in: {expires}")
     else:
         warn("Expiry: not found")
 
@@ -167,28 +185,17 @@ def check_vm_license(text: str):
     if max_dev: info(f"Max devices: {max_dev}")
 
 
-def _parse_kb(s: str) -> float:
-    """Parse strings like '8,161,460 KB' or '8161460' into float KB."""
-    s = s.replace(",", "").replace(" KB", "").replace("KB", "").strip()
-    try:
-        return float(s)
-    except ValueError:
-        return 0.0
-
-
 def check_performance(text: str):
     section("Resource Performance (get system performance)")
-    # Use the second occurrence which is more complete
-    idx1 = text.find("### get system performance")
-    idx2 = text.find("### get system performance", idx1 + 1) if idx1 != -1 else -1
+    idx1  = text.find("### get system performance")
+    idx2  = text.find("### get system performance", idx1 + 1) if idx1 != -1 else -1
     start = idx2 if idx2 != -1 else idx1
     if start == -1:
         warn("get system performance section not found")
         return
-    end = text.find("### ", start + 1)
+    end   = text.find("### ", start + 1)
     block = text[start:end].strip() if end != -1 else text[start:].strip()
 
-    # CPU
     cpu_used = first_match(r"Used:\s+([\d.]+)%", block)
     if cpu_used:
         pct = float(cpu_used)
@@ -196,31 +203,25 @@ def check_performance(text: str):
     else:
         warn("CPU usage: not found")
 
-    # Memory (excluding swap)
     mem_total = first_match(r"Total \(Excluding Swap\):\s+([\d,]+\s*KB)", block)
-    mem_used = first_match(r"Used \(Excluding Swap\):\s+([\d,]+\s*KB)\s+([\d.]+)%", block)
-    mem_pct = first_match(r"Used \(Excluding Swap\):\s+[\d,]+\s*KB\s+([\d.]+)%", block)
+    mem_pct   = first_match(r"Used \(Excluding Swap\):\s+[\d,]+\s*KB\s+([\d.]+)%", block)
     if mem_total and mem_pct:
+        pct      = float(mem_pct)
         total_gb = _parse_kb(mem_total) / 1024 / 1024
-        pct = float(mem_pct)
-        (warn if pct > 85 else ok)(
-            f"RAM used: {pct:.1f}%  (total: {total_gb:.1f} GB excl. swap)"
-        )
+        (warn if pct > 85 else ok)(f"RAM used: {pct:.1f}%  (total: {total_gb:.1f} GB excl. swap)")
     else:
         warn("Memory usage (excl. swap): not found")
 
-    # Hard disk
     hd_total = first_match(r"Hard Disk:\s*\n\s*Total:\s+([\d,]+\s*KB)", block)
-    hd_pct = first_match(r"Hard Disk:.*?Used:\s+[\d,]+\s*KB\s+([\d.]+)%", block, re.DOTALL)
+    hd_pct   = first_match(r"Hard Disk:.*?Used:\s+[\d,]+\s*KB\s+([\d.]+)%", block, re.DOTALL)
     if hd_total and hd_pct:
+        pct      = float(hd_pct)
         total_gb = _parse_kb(hd_total) / 1024 / 1024
-        pct = float(hd_pct)
         fn = crit if pct > DISK_CRIT_PCT else (warn if pct > DISK_WARN_PCT else ok)
         fn(f"Disk used: {pct:.1f}%  (total: {total_gb:.1f} GB)")
     else:
         warn("Hard disk usage: not found")
 
-    # Flash
     fl_pct = first_match(r"Flash Disk:.*?Used:\s+[\d,]+\s*KB\s+([\d.]+)%", block, re.DOTALL)
     if fl_pct:
         pct = float(fl_pct)
@@ -228,46 +229,59 @@ def check_performance(text: str):
 
 
 def check_sizing(text: str):
-    section("Sizing Check (Fortinet Minimum Requirements, FMG 7.6)")
+    section("Sizing Check (Fortinet Minimum Requirements)")
+
+    status_block  = section_text(text, "### get system status")
+    platform_full = first_match(r"^Platform Full Name\s*:\s*(.+)$", status_block, re.MULTILINE) or ""
+    platform_type = first_match(r"^Platform Type\s*:\s*(.+)$",      status_block, re.MULTILINE) or ""
+    is_vm         = "-VM" in platform_type.upper()
+    is_faz        = "FortiAnalyzer" in platform_full
+
+    if not is_vm:
+        info(f"Platform: {platform_type}")
+        info("Physical hardware appliance — VM resource checks do not apply")
+        info("Refer to the hardware datasheet for this model's specifications")
+        dvm_block  = section_text(text, "### diag dvm device list")
+        managed_m  = re.search(r"There are currently (\d+) devices/vdoms managed", dvm_block)
+        licensed_m = re.search(r"There are currently (\d+) devices/vdoms count for license", dvm_block)
+        info(f"Devices managed: {managed_m.group(1) if managed_m else 'N/A'}  "
+             f"(licensed: {licensed_m.group(1) if licensed_m else 'N/A'})")
+        return
+
+    if is_faz:
+        info("FortiAnalyzer VM sizing is evaluated under FAZ Log Rate check")
+        return
+
+    # FMG VM sizing
     info("Reference: docs.fortinet.com/document/fortimanager-private-cloud/"
          "7.6.0/kvm-administration-guide/583600/minimum-system-requirements")
     print()
 
-    # ---------------------------
-    # Collect actual resources
-    # ---------------------------
-
-    # vCPU: processor IDs are 0-based so count = max_id + 1
-    cpu_block = section_text(text, "### diag system print cpuinfo")
+    cpu_block  = section_text(text, "### diag system print cpuinfo")
     processors = re.findall(r"^processor\s*:\s*(\d+)", cpu_block, re.MULTILINE)
-    vcpu_count = max(int(p) for p in processors) + 1 if processors else 0
-    if vcpu_count == 0:
-        hw_block = section_text(text, "### diag hardware info")
+    if not processors:
+        hw_block   = section_text(text, "### diag hardware info")
         processors = re.findall(r"^processor\s*:\s*(\d+)", hw_block, re.MULTILINE)
-        vcpu_count = max(int(p) for p in processors) + 1 if processors else 0
+    vcpu_count = max(int(p) for p in processors) + 1 if processors else 0
 
-    # RAM
-    mem_block = section_text(text, "### Memory info")
+    mem_block        = section_text(text, "### Memory info")
     mem_total_kb_str = first_match(r"^MemTotal:\s+([\d]+)\s*kB", mem_block, re.MULTILINE)
-    ram_gb = float(mem_total_kb_str) / 1024 / 1024 if mem_total_kb_str else 0.0
+    ram_gb           = float(mem_total_kb_str) / 1024 / 1024 if mem_total_kb_str else 0.0
 
-    # Disk
-    perf_idx = text.find("### get system performance")
+    perf_idx  = text.find("### get system performance")
     perf_idx2 = text.find("### get system performance", perf_idx + 1)
-    start = perf_idx2 if perf_idx2 != -1 else perf_idx
-    perf_end = text.find("### ", start + 1) if start != -1 else -1
-    perf_block = text[start:perf_end] if start != -1 and perf_end != -1 else ""
+    start     = perf_idx2 if perf_idx2 != -1 else perf_idx
+    perf_end  = text.find("### ", start + 1) if start != -1 else -1
+    perf_block   = text[start:perf_end] if start != -1 and perf_end != -1 else ""
     hd_total_str = first_match(r"Hard Disk:\s*\n\s*Total:\s+([\d,]+)\s*KB", perf_block)
-    disk_gb = _parse_kb(hd_total_str) / 1024 / 1024 if hd_total_str else 0.0
+    disk_gb      = _parse_kb(hd_total_str) / 1024 / 1024 if hd_total_str else 0.0
 
-    # Managed device / VDOM count
-    dvm_block = section_text(text, "### diag dvm device list")
-    managed_m = re.search(r"There are currently (\d+) devices/vdoms managed", dvm_block)
-    licensed_m = re.search(r"There are currently (\d+) devices/vdoms count for license", dvm_block)
-    num_managed = int(managed_m.group(1)) if managed_m else 0
+    dvm_block    = section_text(text, "### diag dvm device list")
+    managed_m    = re.search(r"There are currently (\d+) devices/vdoms managed", dvm_block)
+    licensed_m   = re.search(r"There are currently (\d+) devices/vdoms count for license", dvm_block)
+    num_managed  = int(managed_m.group(1))  if managed_m  else 0
     num_licensed = int(licensed_m.group(1)) if licensed_m else 0
 
-    # Print info
     info(f"Actual vCPU      : {vcpu_count if vcpu_count else 'not found'}"
          + (f"  (processors 0..{vcpu_count - 1})" if vcpu_count else ""))
     info(f"Actual RAM       : {ram_gb:.1f} GB")
@@ -275,372 +289,64 @@ def check_sizing(text: str):
     info(f"Devices managed  : {num_managed}  (licensed: {num_licensed})")
     print()
 
-    # ------------------------------------------------------
-    # Find the required tier for the current device count
-    # -------------------------------------------------------
-    current_tier = None
-    next_tier = None
-    for i, (max_dev, min_ram, min_cpu) in enumerate(SIZING_TABLE):
-        if num_managed <= max_dev:
-            current_tier = (max_dev, min_ram, min_cpu)
-            if i + 1 < len(SIZING_TABLE):
-                next_tier = SIZING_TABLE[i + 1]
+    current_tier = next((t for t in FMG_SIZING_TABLE if num_managed <= t[0]), FMG_SIZING_TABLE[-1])
+    next_tier    = None
+    for i, t in enumerate(FMG_SIZING_TABLE):
+        if t == current_tier and i + 1 < len(FMG_SIZING_TABLE):
+            next_tier = FMG_SIZING_TABLE[i + 1]
             break
-    if current_tier is None:
-        current_tier = SIZING_TABLE[-1]
 
     req_max, req_ram, req_cpu = current_tier
-
     info(f"Required tier : up to {req_max} devices/VDOMs  ->  "
-         f"{req_cpu} vCPU, {req_ram} GB RAM,  {ABS_MIN_DISK_GB} GB disk (min)")
+         f"{req_cpu} vCPU, {req_ram} GB RAM,  {FMG_ABS_MIN_DISK_GB} GB disk (min)")
     if next_tier:
-        nx_max, nx_ram, nx_cpu = next_tier
-        info(f"Next tier : up to {nx_max} devices/VDOMs  ->  "
-             f"{nx_cpu} vCPU, {nx_ram} GB RAM,  {ABS_MIN_DISK_GB} GB disk (min)")
+        info(f"Next tier     : up to {next_tier[0]} devices/VDOMs  ->  "
+             f"{next_tier[2]} vCPU, {next_tier[1]} GB RAM,  {FMG_ABS_MIN_DISK_GB} GB disk (min)")
     print()
 
-    # -------------------------------
-    # Device count vs tier ceiling
-    # --------------------------------
-    pct_of_tier = (num_managed / req_max * 100) if req_max else 0
-    info(f"Device count usage: {num_managed} / {req_max} ({pct_of_tier:.1f}% of current tier ceiling)")
-    if pct_of_tier >= 80:
-        warn(f"Device count is at {pct_of_tier:.0f}% of the {req_max}-device tier ceiling — "
-             f"approaching limit, plan upgrade to next tier")
-    elif pct_of_tier >= 60:
-        warn(f"Device count is at {pct_of_tier:.0f}% of the {req_max}-device tier ceiling — "
-             f"monitor growth")
-    else:
-        ok(f"Device count is at {pct_of_tier:.0f}% of the {req_max}-device tier ceiling — "
-           f"capacity is adequate")
+    pct = (num_managed / req_max * 100) if req_max else 0
+    info(f"Device count usage: {num_managed} / {req_max} ({pct:.1f}% of current tier ceiling)")
+    (warn if pct >= 80 else warn if pct >= 60 else ok)(
+        f"Device count is at {pct:.0f}% of the {req_max}-device tier ceiling"
+        + (" — approaching limit" if pct >= 80 else " — monitor growth" if pct >= 60
+           else " — capacity is adequate"))
     print()
 
-    # --------------
-    # vCPU check--
-    # --------------
-    if vcpu_count == 0:
-        warn("vCPU: could not determine from file")
-    elif vcpu_count < ABS_MIN_CPU:
-        crit(f"vCPU: {vcpu_count} is BELOW the absolute minimum of {ABS_MIN_CPU} "
+    # vCPU
+    if vcpu_count < FMG_ABS_MIN_CPU:
+        crit(f"vCPU: {vcpu_count} is BELOW the absolute minimum of {FMG_ABS_MIN_CPU} "
              f"(required {req_cpu} for up to {req_max} devices)")
     elif vcpu_count < req_cpu:
-        crit(f"vCPU: {vcpu_count} is BELOW the required {req_cpu} for {num_managed} devices "
-             f"(tier: up to {req_max} devices requires {req_cpu} vCPU)")
-    elif next_tier and vcpu_count < next_tier[2] and pct_of_tier >= 60:
-        warn(f"vCPU: {vcpu_count} meets current tier ({req_cpu} required) but would be "
-             f"insufficient for the next tier ({next_tier[2]} vCPU needed for up to {next_tier[0]} devices)")
+        crit(f"vCPU: {vcpu_count} is BELOW the required {req_cpu} for {num_managed} devices")
+    elif next_tier and vcpu_count < next_tier[2] and pct >= 60:
+        warn(f"vCPU: {vcpu_count} meets current tier but insufficient for next tier "
+             f"({next_tier[2]} vCPU needed for up to {next_tier[0]} devices)")
     else:
-        ok(f"vCPU: {vcpu_count} meets the requirement for this tier ({req_cpu} vCPU for up to {req_max} devices)")
+        ok(f"vCPU: {vcpu_count} meets requirement ({req_cpu} vCPU for up to {req_max} devices)")
 
-    # ---------
-    # RAM check
-    # ---------
-    if ram_gb == 0:
-        warn("RAM: could not determine from file")
-    elif ram_gb < ABS_MIN_RAM_GB:
-        crit(f"RAM: {ram_gb:.1f} GB is BELOW the absolute minimum of {ABS_MIN_RAM_GB} GB "
-             f"(required {req_ram} GB for up to {req_max} devices)")
+    # RAM
+    if ram_gb < FMG_ABS_MIN_RAM_GB:
+        crit(f"RAM: {ram_gb:.1f} GB is BELOW the absolute minimum of {FMG_ABS_MIN_RAM_GB} GB")
     elif ram_gb < req_ram:
-        crit(f"RAM: {ram_gb:.1f} GB is BELOW the required {req_ram} GB for {num_managed} devices "
-             f"(tier: up to {req_max} devices requires {req_ram} GB)")
+        crit(f"RAM: {ram_gb:.1f} GB is BELOW the required {req_ram} GB for {num_managed} devices")
     elif ram_gb < req_ram * 1.1:
         warn(f"RAM: {ram_gb:.1f} GB meets minimum ({req_ram} GB) but headroom is tight")
-    elif next_tier and ram_gb < next_tier[1] and pct_of_tier >= 60:
-        warn(f"RAM: {ram_gb:.1f} GB meets current tier ({req_ram} GB required) but would be "
-             f"insufficient for the next tier ({next_tier[1]} GB needed for up to {next_tier[0]} devices)")
+    elif next_tier and ram_gb < next_tier[1] and pct >= 60:
+        warn(f"RAM: {ram_gb:.1f} GB meets current tier but insufficient for next tier "
+             f"({next_tier[1]} GB needed for up to {next_tier[0]} devices)")
     else:
-        ok(f"RAM: {ram_gb:.1f} GB meets the requirement for this tier ({req_ram} GB for up to {req_max} devices)")
+        ok(f"RAM: {ram_gb:.1f} GB meets requirement ({req_ram} GB for up to {req_max} devices)")
 
-    # --------------
-    # Disk check
-    # --------------
-    if disk_gb == 0:
-        warn("Disk: could not determine from file")
-    elif disk_gb < ABS_MIN_DISK_GB:
-        crit(f"Disk: {disk_gb:.1f} GB is BELOW the absolute minimum of {ABS_MIN_DISK_GB} GB")
-    elif disk_gb < ABS_MIN_DISK_GB * 1.1:
-        warn(f"Disk: {disk_gb:.1f} GB meets the minimum ({ABS_MIN_DISK_GB} GB) but headroom is tight")
+    # Disk
+    if disk_gb < FMG_ABS_MIN_DISK_GB:
+        crit(f"Disk: {disk_gb:.1f} GB is BELOW the absolute minimum of {FMG_ABS_MIN_DISK_GB} GB")
+    elif disk_gb < FMG_ABS_MIN_DISK_GB * 1.1:
+        warn(f"Disk: {disk_gb:.1f} GB meets minimum ({FMG_ABS_MIN_DISK_GB} GB) but headroom is tight")
     else:
-        ok(f"Disk: {disk_gb:.1f} GB meets the absolute minimum ({ABS_MIN_DISK_GB} GB)")
+        ok(f"Disk: {disk_gb:.1f} GB meets the absolute minimum ({FMG_ABS_MIN_DISK_GB} GB)")
 
-
-def check_devices(text: str):
-    section("Managed Devices (diag dvm device list)")
-    block = section_text(text, "### diag dvm device list")
-
-    # Summary counts
-    for pattern in [
-        r"There are currently (\d+) devices/vdoms managed",
-        r"There are currently (\d+) devices/vdoms count for license",
-        r"There are currently (\d+) FortiAP managed",
-        r"There are currently (\d+) FortiWiFi managed",
-        r"There are currently (\d+) FortiSwitch managed",
-        r"There are currently (\d+) FortiExtender managed",
-    ]:
-        m = re.search(pattern, block)
-        if m:
-            info(re.sub(r"(\d+)", m.group(1),
-                        pattern.replace(r"(\d+)", m.group(1)).replace("\\", ""), 1))
-
-    print()
-
-    # Parse each device line
-    # TYPE  OID  SN  HA  IP  NAME  ADOM  IPS  FIRMWARE  HW_GenX
-    dev_pattern = re.compile(
-        r"^(fmgfaz-managed|\S+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)",
-        re.MULTILINE,
-    )
-    lines = block.splitlines()
-    i = 0
-    found_any = False
-    while i < len(lines):
-        m = dev_pattern.match(lines[i])
-        if m:
-            found_any = True
-            dtype, oid, sn, ha, ip, name, adom = m.groups()
-            info(f"Device: {name}  SN={sn}  IP={ip}  ADOM={adom}")
-
-            # STATUS line
-            if i + 1 < len(lines) and "STATUS:" in lines[i + 1]:
-                status_line = lines[i + 1].strip()
-                conn_ok = "conn: up" in status_line
-                conf_ok = "conf: in sync" in status_line
-                (ok if conn_ok else crit)(
-                    f"  Connection: {'up' if conn_ok else 'DOWN'}"
-                )
-                (ok if conf_ok else warn)(
-                    f"  Config sync: {'in sync' if conf_ok else 'OUT OF SYNC'}"
-                )
-
-            # VDOM / policy package line(s)
-            j = i + 2
-            while j < len(lines) and lines[j].strip().startswith("|-"):
-                vdom_line = lines[j].strip()
-                vdom_m = re.search(r"vdom:\[?\d+\]?(\w+).*?pkg:\[([^\]]+)\]", vdom_line)
-                if vdom_m:
-                    vname, pkg = vdom_m.groups()
-                    if pkg == "never-installed":
-                        crit(f"  vdom:{vname} policy package NEVER INSTALLED")
-                    else:
-                        ok(f"  vdom:{vname} policy pkg: {pkg}")
-                j += 1
-            print()
-        i += 1
-
-    if not found_any:
-        warn("No device entries parsed from diag dvm device list")
-
-
-def check_ntp(text: str):
-    section("NTP Status (diag system ntp status)")
-    block = section_text(text, "### diag system ntp status")
-    if not block:
-        warn("NTP status section not found")
-        return
-
-    lines = [l for l in block.splitlines() if l.strip()]
-    for line in lines:
-        info(line.strip())
-
-    # Check for synchronised indicator
-    if re.search(r"\*\s*\S+", block):  # leading * = selected peer
-        ok("NTP peer selected and synchronised")
-    elif "unsynchronised" in block.lower():
-        crit("NTP: unsynchronised")
-    else:
-        warn("NTP: synchronisation status unclear — check output above")
-
-
-# ----------
-# HA config
-# ----------
-
-def check_ha(text: str):
-    section("High Availability (get system ha)")
-    block = section_text(text, "### get system ha")
-    if not block:
-        warn("HA section not found")
-        return
-
-    mode = first_match(r"^mode\s*:\s*(.+)$", block, re.MULTILINE)
-    if mode is None:
-        # Also check get system status
-        status_block = section_text(text, "### get system status")
-        mode = first_match(r"^HA Mode\s*:\s*(.+)$", status_block, re.MULTILINE)
-
-    if mode:
-        if mode.lower() in ("standalone", "0", "stand alone"):
-            warn(f"HA mode: {mode} (no redundancy)")
-        else:
-            ok(f"HA mode: {mode}")
-    else:
-        warn("HA mode: not found")
-
-
-# -----------
-# Crash log
-# ------------
-
-def check_crash_log(text: str):
-    section("Crash Log")
-    # Look for crashlog section
-    crash_markers = [
-        "### diag debug crashlog read",
-        "### diag debug crash read",
-        "crashlog",
-    ]
-    block = ""
-    for marker in crash_markers:
-        block = section_text(text, marker)
-        if block:
-            break
-
-    crash_kw = re.compile(
-        r"(signal|segfault|bus error|aborted|coredump|killed|oom|"
-        r"svc cdb|svc dvmdb|securityconsole.*crash|assert)", re.IGNORECASE
-    )
-
-    if not block:
-        warn("No crashlog section found in file")
-    else:
-        crash_lines = [l for l in block.splitlines() if crash_kw.search(l)]
-        if crash_lines:
-            crit(f"Found {len(crash_lines)} crash-related line(s):")
-            for line in crash_lines[:15]:
-                crit(f"  {line.strip()}")
-        else:
-            ok("No crash keywords found in crashlog section")
-
-    # Also scan the whole file for crash indicators outside dedicated section
-    all_crash = re.findall(
-        r"^.*(?:Signal \d+|Segmentation fault|Bus error|double free|"
-        r"svc cdb reader.*crash|securityconsole.*abort).*$",
-        text, re.IGNORECASE | re.MULTILINE
-    )
-    if all_crash:
-        warn(f"Additional crash indicators found elsewhere in file ({len(all_crash)} line(s)):")
-        for line in all_crash[:10]:
-            warn(f"  {line.strip()[:120]}")
-
-
-# ----------
-# ADOM check
-# ----------
-def check_adoms(text: str):
-    section("ADOM List (diag dvm adom list)")
-    block = section_text(text, "### diag dvm adom list")
-    if not block:
-        warn("ADOM list section not found")
-        return
-
-    lines = [l for l in block.splitlines() if l.strip() and not l.startswith("-")]
-    locked = [l for l in lines if "locked" in l.lower()]
-
-    info(f"ADOM entries: {len(lines)}")
-    if locked:
-        warn(f"Locked ADOMs: {len(locked)}")
-        for l in locked:
-            warn(f"  {l.strip()}")
-    else:
-        ok("No locked ADOMs")
-
-    for line in lines[:15]:
-        print(f"    {line.strip()}")
-    if len(lines) > 15:
-        info(f"  ... and {len(lines) - 15} more")
-
-
-# ----------
-# License
-# ----------
-def check_license_list(text: str):
-    section("License List (diag license list)")
-    block = section_text(text, "### diag license list")
-    if not block:
-        warn("License list section not found")
-        return
-
-    lines = [l for l in block.splitlines() if l.strip()
-             and not l.startswith("Name") and not l.startswith("-")]
-    for line in lines:
-        if "No License" in line:
-            warn(line.strip())
-        elif re.search(r"Valid|Licensed", line, re.IGNORECASE):
-            ok(line.strip())
-        else:
-            info(line.strip())
-
-
-# ----------
-# Flash disk
-# ----------
-def check_flash(text: str):
-    section("Flash Disk (diag system flash list)")
-    block = section_text(text, "### diag system flash list")
-    if not block:
-        warn("Flash list section not found")
-        return
-
-    for line in block.splitlines():
-        if re.search(r"\d+%", line):
-            pct_m = re.search(r"(\d+)%", line)
-            pct = int(pct_m.group(1)) if pct_m else 0
-            (warn if pct > 80 else ok)(f"Flash: {line.strip()}")
-        elif line.strip():
-            info(line.strip())
-
-
-# ----------
-# tasks check
-# ----------
-def check_tasks(text: str):
-    section("Task History (diag task task list)")
-    # TAC reports sometimes include task output
-    block = section_text(text, "### diag task task list")
-    if not block:
-        # Try alternate header
-        block = section_text(text, "task/task")
-    if not block:
-        info("Task history section not found in this file")
-        info("(Task history is available via GUI: Device Manager > Task Monitor)")
-        return
-
-    lines = [l for l in block.splitlines() if l.strip()]
-    errors = [l for l in lines if re.search(r"error|fail|abort", l, re.IGNORECASE)]
-    ok(f"Task lines found: {len(lines)}")
-    if errors:
-        warn(f"Tasks with error/fail: {len(errors)}")
-        for l in errors:
-            crit(f"  {l.strip()}")
-
-
-# ----------
-# Version
-# ----------
-def _parse_version(ver_str: str):
-    """
-    Parse a Fortinet version string like 'v7.4.10-build2778' into a tuple
-    (major, minor, patch, build) for numeric comparison.
-    """
-    m = re.search(r"v?(\d+)\.(\d+)\.(\d+)-build(\d+)", ver_str)
-    if m:
-        return tuple(int(x) for x in m.groups())
-    # fallback: try v7.6.6
-    m = re.search(r"v?(\d+)\.(\d+)\.(\d+)", ver_str)
-    if m:
-        return tuple(int(x) for x in m.groups()) + (0,)
-    return None
-
-
-# ----------
-# Upgrade
-# ----------
 
 def check_cdb_upgrade(text: str):
-    """
-    Parses 'diag cdb upgrade summary' to detect any downgrades in the
-    FMG version chain.
-    """
     section("CDB Upgrade History (diag cdb upgrade summary)")
 
     block = section_text(text, "### diag cdb upgrade summary")
@@ -648,24 +354,21 @@ def check_cdb_upgrade(text: str):
         warn("diag cdb upgrade summary section not found in file")
         return
 
-    # Version entries look like: "2026-04-14 16:54:50     v7.4.10-build2778 260126 (GA.M)"
     ver_pattern = re.compile(
         r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(v[\d.]+-build\d+[^\n]*?)$",
         re.MULTILINE,
     )
     entries = ver_pattern.findall(block)
-
     if not entries:
         warn("No version entries found in cdb upgrade summary")
         return
 
     info(f"CDB version chain ({len(entries)} entr{'y' if len(entries) == 1 else 'ies'}):")
-    prev_ver = None
-    prev_tuple = None
+    prev_ver, prev_tuple = None, None
     downgrade_found = False
 
     for ts, ver_raw in entries:
-        ver = ver_raw.strip()
+        ver       = ver_raw.strip()
         cur_tuple = _parse_version(ver)
 
         if prev_tuple is None:
@@ -678,8 +381,7 @@ def check_cdb_upgrade(text: str):
         else:
             ok(f"  {ts}  {ver}  (upgrade from {prev_ver})")
 
-        prev_ver = ver
-        prev_tuple = cur_tuple
+        prev_ver, prev_tuple = ver, cur_tuple
 
     print()
     if downgrade_found:
@@ -688,38 +390,24 @@ def check_cdb_upgrade(text: str):
         ok("No downgrades detected in CDB version chain")
 
 
-# --------------------------------------
-# FDS sizing in case FMG is being used as FDS server
-# ---------------------------------
 def check_fds_sizing(text: str):
-    """
-    Checks FMG-as-FDS (FortiGuard Distribution Server) sizing based on:
-      https://docs.fortinet.com/document/fortimanager/7.6.0/best-practices/14860/
-              fortimanager-performance-and-sizing-in-closed-networks
-
-    1. Detects whether FGD rating services are enabled (diag fmupdate view-service-info fgd)
-    2. If FDS is active, calculates additional RAM required using Fortinet formula:
-         VMtotal = FMGreq + 2 x (WFdb + IOTdb + FQdb + ASdb + AVQdb)
-       Using Jan 2026 database sizes: WF=13 GB, IoT=18 GB, FQ=5 GB, AS=0.5 GB, AVQ=0.5 GB
-    3. Checks fds-setting max-work against Fortinet's FDS worker recommendation table:
-         1-50 devices   -> 1 worker  (default)
-         50-1000        -> 10 workers
-         1000-3000      -> 24 workers
-         3000+          -> 24 workers
-    """
     section("FDS Sizing (closed network / FortiGuard Distribution Server)")
-    info("Reference: docs.fortinet.com/document/fortimanager/7.6.0/best-practices/14860/")
 
-    # -----------------------------------------------
-    # 1. Check which FGD rating services are enabled
-    # ------------------------------------------------
-    svc_block = section_text(text, "### diag fmupdate view-service-info fgd")
-    if not svc_block:
-        warn("diag fmupdate view-service-info fgd section not found")
+    status_block  = section_text(text, "### get system status")
+    platform_full = first_match(r"^Platform Full Name\s*:\s*(.+)$", status_block, re.MULTILINE) or ""
+    if "FortiAnalyzer" in platform_full:
+        info("FortiAnalyzer detected — FDS sizing check not applicable")
         return
 
-    svc_lines = [l.strip() for l in svc_block.splitlines() if ":" in l]
-    enabled_svcs = [l for l in svc_lines if l.endswith(": on")]
+    info("Reference: docs.fortinet.com/document/fortimanager/7.6.0/best-practices/14860/")
+
+    svc_block = section_text(text, "### diag fmupdate view-service-info fgd")
+    if not svc_block:
+        info("diag fmupdate view-service-info fgd section not found — skipping FDS check")
+        return
+
+    svc_lines     = [l.strip() for l in svc_block.splitlines() if ":" in l]
+    enabled_svcs  = [l for l in svc_lines if l.endswith(": on")]
     disabled_svcs = [l for l in svc_lines if l.endswith(": off")]
 
     info(f"FGD rating services enabled : {len(enabled_svcs)}")
@@ -733,105 +421,66 @@ def check_fds_sizing(text: str):
         info("enable the required services and re-run this check")
         return
 
-    # FDS is active — print which services are on
     for svc in enabled_svcs:
         ok(f"  Service active: {svc}")
     for svc in disabled_svcs:
         info(f"  Service off   : {svc}")
     print()
 
-    # ---------------------------------------------------------------
-    # 2. RAM formula
-    # Primary: parse actual DB sizes from diag fmupdate fgd-dbver
-    # Fallback: Jan 2026 estimates from Fortinet docs
-    #   WF=13 GB, IoT=18 GB (3 dbs), FQ=5 GB, AS=0.5 GB, AVQ=0.5 GB
-    # --------------------------------------------------------------
-
-    # Jan 2026 fallback sizes (GB)
     FALLBACK_DB_SIZES = {
-        "webfilter": 13.0,
-        "iot": 18.0,
-        "filequery": 5.0,
-        "antispam": 0.5,
-        "avquery": 0.5,
+        "webfilter": 13.0, "iot": 18.0, "filequery": 5.0,
+        "antispam": 0.5, "avquery": 0.5,
     }
-
-    # Parse fgd-dbver: lines like "wf   Webfilter   00001.00123  2026-01-20  13.21G"
-    # Size field may be in MB (e.g. 256.71M) or GB (e.g. 13.21G) or absent
-    dbver_block = section_text(text, "### diag fmupdate fgd-dbver")
-
-    def parse_dbver_size(size_str: str) -> float:
-        """Convert '13.21G' or '256.71M' to GB float. Returns 0.0 if empty."""
-        if not size_str:
-            return 0.0
-        size_str = size_str.strip()
-        if size_str.endswith("G"):
-            return float(size_str[:-1])
-        if size_str.endswith("M"):
-            return float(size_str[:-1]) / 1024
-        if size_str.endswith("K"):
-            return float(size_str[:-1]) / 1024 / 1024
-        return 0.0
-
-    # Map TAC report category codes to our DB keys
-    # wf -> webfilter; iotm+iotr+iots -> iot; fq -> filequery
-    # as1+as2+as4 -> antispam; av+av2 -> avquery
     DBVER_MAP = {
-        "wf": "webfilter",
-        "iotm": "iot", "iotr": "iot", "iots": "iot",
-        "fq": "filequery",
-        "as1": "antispam", "as2": "antispam", "as4": "antispam",
+        "wf": "webfilter", "iotm": "iot", "iotr": "iot", "iots": "iot",
+        "fq": "filequery", "as1": "antispam", "as2": "antispam", "as4": "antispam",
         "av": "avquery", "av2": "avquery",
     }
 
-    # Parse each line: "code   Description   Version   DateTime   Size"
-    actual_db_sizes = {}  # db_key -> GB (summed across sub-DBs)
+    def parse_dbver_size(s):
+        s = s.strip()
+        if s.endswith("G"): return float(s[:-1])
+        if s.endswith("M"): return float(s[:-1]) / 1024
+        if s.endswith("K"): return float(s[:-1]) / 1024 / 1024
+        return 0.0
+
+    actual_db_sizes  = {}
+    dbver_block      = section_text(text, "### diag fmupdate fgd-dbver")
     dbver_size_source = "Jan 2026 Fortinet doc estimates (DBs not yet downloaded)"
 
     if dbver_block:
         for line in dbver_block.splitlines():
             parts = line.split()
-            # Need at least code + description; size is last column if present
-            if len(parts) < 2:
-                continue
+            if len(parts) < 2: continue
             code = parts[0].lower()
-            if code not in DBVER_MAP:
-                continue
-            # Size is the last token if it ends with G/M/K; otherwise absent
-            size_gb = 0.0
+            if code not in DBVER_MAP: continue
             if parts[-1][-1] in ("G", "M", "K") and re.match(r"[\d.]+[GMK]$", parts[-1]):
-                size_gb = parse_dbver_size(parts[-1])
-            if size_gb > 0:
-                db_key = DBVER_MAP[code]
-                actual_db_sizes[db_key] = actual_db_sizes.get(db_key, 0.0) + size_gb
+                sz = parse_dbver_size(parts[-1])
+                if sz > 0:
+                    actual_db_sizes[DBVER_MAP[code]] = actual_db_sizes.get(DBVER_MAP[code], 0.0) + sz
+        if actual_db_sizes:
+            dbver_size_source = "actual sizes from diag fmupdate fgd-dbver"
 
-    if actual_db_sizes:
-        dbver_size_source = "actual sizes from diag fmupdate fgd-dbver"
-
-    # Map service on/off to DB keys
     SVC_MAP = {
         "webfilter": re.compile(r"webfilter.*: on", re.IGNORECASE),
-        "iot": re.compile(r"iot.*: on", re.IGNORECASE),
+        "iot":       re.compile(r"iot.*: on", re.IGNORECASE),
         "filequery": re.compile(r"file query.*: on", re.IGNORECASE),
-        "antispam": re.compile(r"antispam.*: on", re.IGNORECASE),
-        "avquery": re.compile(r"antivirus query.*: on|outbreak.*: on", re.IGNORECASE),
+        "antispam":  re.compile(r"antispam.*: on", re.IGNORECASE),
+        "avquery":   re.compile(r"antivirus query.*: on|outbreak.*: on", re.IGNORECASE),
     }
 
-    # Get base FMGreq from actual RAM
-    mem_block = section_text(text, "### Memory info")
+    mem_block        = section_text(text, "### Memory info")
     mem_total_kb_str = first_match(r"^MemTotal:\s+([\d]+)\s*kB", mem_block, re.MULTILINE)
-    fmg_req_gb = float(mem_total_kb_str) / 1024 / 1024 if mem_total_kb_str else 0.0
+    fmg_req_gb       = float(mem_total_kb_str) / 1024 / 1024 if mem_total_kb_str else 0.0
 
-    # Sum enabled DB sizes (prefer actual, fall back to estimates)
-    enabled_db_total = 0.0
-    active_dbs = []
+    enabled_db_total, active_dbs = 0.0, []
     for db_key, pattern in SVC_MAP.items():
         if any(pattern.search(l) for l in svc_lines):
             if db_key in actual_db_sizes:
-                size = actual_db_sizes[db_key]
+                size  = actual_db_sizes[db_key]
                 label = f"{db_key} ({size:.2f} GB — from fgd-dbver)"
             else:
-                size = FALLBACK_DB_SIZES[db_key]
+                size  = FALLBACK_DB_SIZES[db_key]
                 label = f"{db_key} ({size:.1f} GB — Jan 2026 estimate)"
             enabled_db_total += size
             active_dbs.append(label)
@@ -854,41 +503,24 @@ def check_fds_sizing(text: str):
         crit("  Risk: high I/O wait, degraded FortiManager performance, possible OOM")
     else:
         ok(f"RAM: {fmg_req_gb:.1f} GB meets FDS-adjusted requirement of {vm_total_required:.1f} GB")
-
     print()
 
-    # --------------------------------
-    # 3. FDS worker (max-work) check
-    # -------------------------------
-    # FDS worker recommendation table (Fortinet docs):
-    #   1-50 devices    -> 1  (default)
-    #   50-1000         -> 10
-    #   1000-3000       -> 24
-    #   3000+           -> 24
     FDS_WORKER_TABLE = [
-        (50, 1, "1-50 devices"),
-        (1000, 10, "50-1000 devices"),
-        (3000, 24, "1000-3000 devices"),
-        (9999999, 24, "3000+ devices"),
+        (50, 1, "1-50 devices"), (1000, 10, "50-1000 devices"),
+        (3000, 24, "1000-3000 devices"), (9999999, 24, "3000+ devices"),
     ]
-
-    # Get device count
     dvm_block = section_text(text, "### diag dvm device list")
     managed_m = re.search(r"There are currently (\d+) devices/vdoms managed", dvm_block)
     num_devices = int(managed_m.group(1)) if managed_m else 0
 
-    # Get configured max-work from fds-setting block
     fds_block = section_text(text, "config fmupdate fds-setting")
     maxwork_m = re.search(r"set\s+max-work\s+(\d+)", fds_block)
-    max_work = int(maxwork_m.group(1)) if maxwork_m else 1  # default is 1
+    max_work  = int(maxwork_m.group(1)) if maxwork_m else 1
 
-    # Find recommended workers
-    recommended_workers = 1
-    recommended_label = "1-50 devices"
+    recommended_workers, recommended_label = 1, "1-50 devices"
     for threshold, workers, label in FDS_WORKER_TABLE:
         if num_devices <= threshold:
-            recommended_workers = workers
-            recommended_label = label
+            recommended_workers, recommended_label = workers, label
             break
 
     info(f"Managed devices       : {num_devices}")
@@ -898,19 +530,140 @@ def check_fds_sizing(text: str):
 
     if max_work < recommended_workers:
         crit(f"FDS workers: {max_work} is BELOW recommended {recommended_workers} for {num_devices} devices")
-        crit(f"  Impact: AV/IPS updates will be slow and CPU usage will be high")
         crit(f"  Fix: config fmupdate fds-setting -> set max-work {recommended_workers}")
     elif max_work == recommended_workers:
         ok(f"FDS workers: {max_work} matches recommendation for {num_devices} devices")
     else:
         ok(f"FDS workers: {max_work} exceeds minimum recommendation ({recommended_workers}) for {num_devices} devices")
         if max_work > 24:
-            warn("Note: Fortinet docs state there is no benefit to max-work above 24")
+            warn("Note: no benefit to max-work above 24 per Fortinet docs")
 
 
-# ----------
-# Klog
-# ----------
+def check_faz_lograte(text: str):
+    section("FAZ Log Rate and Sizing")
+
+    status_block  = section_text(text, "### get system status")
+    platform_full = first_match(r"^Platform Full Name\s*:\s*(.+)$", status_block, re.MULTILINE) or ""
+    platform_type = first_match(r"^Platform Type\s*:\s*(.+)$",      status_block, re.MULTILINE) or ""
+    if "FortiAnalyzer" not in platform_full:
+        info("FortiManager detected — FAZ log rate check not applicable")
+        return
+
+    is_vm = "-VM" in platform_type.upper()
+
+    info("Reference: docs.fortinet.com/document/fortianalyzer-private-cloud/"
+         "8.0.0/kvm-administration-guide/583600/minimum-system-requirements")
+
+    limits_block = section_text(text, "### get system loglimits")
+    peak_str     = first_match(r"^Peak Log Rate\s*:\s*(\d+)",     limits_block, re.MULTILINE)
+    sust_str     = first_match(r"^Sustained Log Rate\s*:\s*(\d+)", limits_block, re.MULTILINE)
+    gb_str       = first_match(r"^GB/day\s*:\s*(\d+)",            limits_block, re.MULTILINE)
+    peak_rate    = int(peak_str) if peak_str else None
+    sustained    = int(sust_str) if sust_str else None
+
+    if limits_block:
+        info(f"Licensed GB/day          : {gb_str or 'N/A'}")
+        info(f"Licensed Peak Log Rate   : {peak_rate or 'N/A'} logs/sec")
+        info(f"Licensed Sustained Rate  : {sustained or 'N/A'} logs/sec")
+    else:
+        warn("get system loglimits section not found")
+    print()
+
+    lograte_block = section_text(text, "### diag fortilogd lograte")
+    actual_rate   = None
+    if lograte_block:
+        for pattern in [r"last 60 seconds:\s*([\d.]+)",
+                        r"last 30 seconds:\s*([\d.]+)",
+                        r"last 5 seconds:\s*([\d.]+)"]:
+            m = re.search(pattern, lograte_block, re.IGNORECASE)
+            if m:
+                actual_rate = float(m.group(1))
+                break
+        info(f"Actual receive rate      : {actual_rate if actual_rate is not None else 'N/A'} logs/sec")
+    else:
+        info("diag fortilogd lograte   : section not found")
+    print()
+
+    lf_idx = text.find("config system log-forward")
+    if lf_idx != -1:
+        lf_end   = text.find("\nend\n", lf_idx)
+        lf_block = text[lf_idx:lf_end + 5] if lf_end != -1 else ""
+        num_fwds = len(re.findall(r"^\s{4}edit\s+\d+", lf_block, re.MULTILINE))
+    else:
+        num_fwds = 0
+
+    info(f"Log forwarders configured: {num_fwds}")
+
+    logfwd_diag = section_text(text, "### diagnose test application logfwd 4")
+    if num_fwds > 0 and logfwd_diag:
+        lag_matches = re.findall(
+            r"\*\*\s+Loader:\s+ld-(\S+).*?lag-behind=([\d.]+)%\s+\((\d+)\)",
+            logfwd_diag, re.DOTALL)
+        for fwd_name, lag_pct, lag_bytes in lag_matches:
+            pct = float(lag_pct)
+            msg = f"  Forwarder {fwd_name}: lag-behind {lag_pct}% ({lag_bytes} bytes)"
+            (crit if pct > 5 else warn if pct > 1 else ok)(msg)
+
+        server_matches = re.findall(
+            r"\*\*\s+Server#\d+:\s+(\S+).*?log/sec:\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)",
+            logfwd_diag, re.DOTALL)
+        for srv, r5, r30, r60 in server_matches:
+            info(f"  Server {srv}: log/sec last 5s={r5} 30s={r30} 60s={r60}")
+    print()
+
+    if actual_rate is not None:
+        eff_rate = actual_rate * (1 + num_fwds)
+        if num_fwds > 0:
+            info(f"Effective sizing rate    : {actual_rate:.0f} x (1 + {num_fwds}) = {eff_rate:.0f} logs/sec")
+        else:
+            info(f"Effective sizing rate    : {eff_rate:.0f} logs/sec (no forwarders)")
+    else:
+        eff_rate = None
+        info("Effective sizing rate    : cannot calculate (actual rate not available)")
+
+    if actual_rate is not None and peak_rate is not None:
+        print()
+        if actual_rate > peak_rate:
+            crit(f"Actual rate {actual_rate:.0f} EXCEEDS licensed Peak Log Rate of {peak_rate} logs/sec")
+        elif actual_rate > peak_rate * 0.8:
+            warn(f"Actual rate {actual_rate:.0f} is within 20% of licensed Peak Log Rate ({peak_rate} logs/sec)")
+        else:
+            ok(f"Actual rate {actual_rate:.0f} is within licensed Peak Log Rate ({peak_rate} logs/sec)")
+
+    if not is_vm:
+        info("Hardware appliance — VM sizing table check not applicable")
+        return
+
+    if eff_rate is None:
+        warn("Cannot perform VM sizing check — actual log rate not available")
+        return
+
+    cpu_block  = section_text(text, "### diag system print cpuinfo")
+    processors = re.findall(r"^processor\s*:\s*(\d+)", cpu_block, re.MULTILINE)
+    vcpu_count = max(int(p) for p in processors) + 1 if processors else 0
+    mem_block  = section_text(text, "### Memory info")
+    mem_str    = first_match(r"^MemTotal:\s+([\d]+)\s*kB", mem_block, re.MULTILINE)
+    ram_gb     = float(mem_str) / 1024 / 1024 if mem_str else 0.0
+
+    tier = next((t for t in FAZ_SIZING_TABLE if eff_rate <= t[0]), FAZ_SIZING_TABLE[-1])
+    req_rate, req_ram, req_cpu, req_iops = tier
+    print()
+    info(f"Required sizing tier     : up to {req_rate} logs/sec -> "
+         f"{req_cpu} vCPU, {req_ram} GB RAM, {req_iops} IOPS")
+
+    if vcpu_count and vcpu_count < req_cpu:
+        crit(f"vCPU: {vcpu_count} is BELOW required {req_cpu} for {eff_rate:.0f} logs/sec effective rate")
+    elif vcpu_count:
+        ok(f"vCPU: {vcpu_count} meets requirement ({req_cpu} needed for this tier)")
+
+    if ram_gb and ram_gb < req_ram:
+        crit(f"RAM: {ram_gb:.1f} GB is BELOW required {req_ram} GB for {eff_rate:.0f} logs/sec effective rate")
+    elif ram_gb:
+        ok(f"RAM: {ram_gb:.1f} GB meets requirement ({req_ram} GB needed for this tier)")
+
+    info(f"IOPS requirement         : {req_iops} IOPS — verify storage performance separately")
+
+
 def check_klog(text: str):
     section("Kernel Log (diag debug klog)")
 
@@ -919,66 +672,48 @@ def check_klog(text: str):
         warn("diag debug klog section not found in file")
         return
 
-    # Parse the block line-by-line, tracking the current @@@ boot timestamp
-    # and annotating each matching line with a resolved wall-clock time.
     boot_ts_pattern = re.compile(r"^@@@(.+)$")
-    uptime_pattern = re.compile(r"^\s*<?[^>]*>?\s*\[\s*([\d.]+)\]")
-    oom_pattern = re.compile(
+    uptime_pattern  = re.compile(r"^\s*<?[^>]*>?\s*\[\s*([\d.]+)\]")
+    oom_pattern     = re.compile(
         r"out.of.memory|oom.killer|oom-kill(?:er)?|killed process"
-        r"|oom_score|cannot allocate memory",
-        re.IGNORECASE,
-    )
-    fsck_pattern = re.compile(
+        r"|oom_score|cannot allocate memory", re.IGNORECASE)
+    fsck_pattern    = re.compile(
         r"e2fsck|fsck|maximal mount count reached"
         r"|ext[234]-fs.{0,10}error|ext[234]-fs.{0,10}warning"
         r"|journal.*abort|i/o error.*block|bad block"
-        r"|filesystem.*corrupt|remount.*read.only",
-        re.IGNORECASE,
-    )
+        r"|filesystem.*corrupt|remount.*read.only", re.IGNORECASE)
 
-    def resolve_time(boot_str: str, uptime_secs: float) -> str:
-        """Add uptime_secs to the @@@ boot timestamp and return a string."""
-        # @@@ format: "Mon Mar 16 12:48:35 2026"
+    def resolve_time(boot_str, uptime_secs):
         for fmt in ("%a %b %d %H:%M:%S %Y", "%a %b  %d %H:%M:%S %Y"):
             try:
-                from datetime import datetime, timedelta
                 dt = datetime.strptime(boot_str.strip(), fmt)
-                dt += timedelta(seconds=uptime_secs)
-                return dt.strftime("%a %b %d %H:%M:%S %Y")
+                return (dt + timedelta(seconds=uptime_secs)).strftime("%a %b %d %H:%M:%S %Y")
             except ValueError:
-                continue
+                pass
         return boot_str.strip()
 
     current_boot = None
-    oom_hits = []  # list of (wall_clock_str, raw_line)
-    fsck_hits = []
+    oom_hits, fsck_hits = [], []
 
     for line in block.splitlines():
         m = boot_ts_pattern.match(line)
         if m:
             current_boot = m.group(1)
             continue
-
-        is_oom = bool(oom_pattern.search(line))
+        is_oom  = bool(oom_pattern.search(line))
         is_fsck = bool(fsck_pattern.search(line))
         if not (is_oom or is_fsck):
             continue
-
-        # Resolve wall-clock time
         wall = current_boot or "unknown boot time"
-        um = uptime_pattern.match(line)
+        um   = uptime_pattern.match(line)
         if um and current_boot:
             try:
                 wall = resolve_time(current_boot, float(um.group(1)))
             except Exception:
                 pass
+        if is_oom:  oom_hits.append((wall, line.strip()))
+        if is_fsck: fsck_hits.append((wall, line.strip()))
 
-        if is_oom:
-            oom_hits.append((wall, line.strip()))
-        if is_fsck:
-            fsck_hits.append((wall, line.strip()))
-
-    # OOM results
     if oom_hits:
         crit(f"Out-of-memory events found: {len(oom_hits)}")
         for wall, line in oom_hits[:10]:
@@ -988,12 +723,10 @@ def check_klog(text: str):
     else:
         ok("No out-of-memory events found in kernel log")
 
-    # fsck / filesystem results
     if fsck_hits:
-        errors = [(w, l) for w, l in fsck_hits
-                  if re.search(r"error|abort|corrupt|read.only|bad block|i/o error", l, re.IGNORECASE)]
+        errors   = [(w, l) for w, l in fsck_hits
+                    if re.search(r"error|abort|corrupt|read.only|bad block|i/o error", l, re.IGNORECASE)]
         warnings = [(w, l) for w, l in fsck_hits if (w, l) not in errors]
-
         if errors:
             crit(f"Filesystem errors found: {len(errors)}")
             for wall, line in errors[:10]:
@@ -1008,66 +741,15 @@ def check_klog(text: str):
         ok("No fsck or filesystem errors/warnings found in kernel log")
 
 
-# ----------
-# FIPS/ADOM config
-# ----------
-
-def check_security_config(text: str):
-    """
-    Checks FIPS mode and Admin Domain (ADOM) configuration status
-    from 'get system status'.
-
-    FIPS mode: should be Enabled in high-security/compliance environments.
-    ADOM config: Enabled means multi-tenancy is active; Disabled means
-                 all devices share a single management domain (root).
-    """
-    section("Security Config (FIPS Mode / Admin Domain)")
-
-    block = section_text(text, "### get system status")
-
-    # FIPS Mode
-    fips = first_match(r"^FIPS Mode\s*:\s*(.+)$", block, re.MULTILINE)
-    if fips is None:
-        warn("FIPS Mode: not found in get system status")
-    elif fips.strip().lower() == "enabled":
-        ok(f"FIPS Mode: {fips.strip()} — cryptographic compliance enforced")
-    else:
-        warn(f"FIPS Mode: {fips.strip()} — not enabled; required for FIPS-compliant deployments")
-
-    # Admin Domain (ADOM) Configuration
-    adom_cfg = first_match(r"^Admin Domain Configuration\s*:\s*(.+)$", block, re.MULTILINE)
-    max_adoms = first_match(r"^Max Number of Admin Domains\s*:\s*(.+)$", block, re.MULTILINE)
-
-    if adom_cfg is None:
-        warn("Admin Domain Configuration: not found in get system status")
-    elif adom_cfg.strip().lower() == "enabled":
-        ok(f"Admin Domain Configuration: {adom_cfg.strip()} (multi-tenancy active)")
-        if max_adoms:
-            info(f"Max Admin Domains: {max_adoms.strip()}")
-    else:
-        warn(f"Admin Domain Configuration: {adom_cfg.strip()} — all devices share the root ADOM")
-        info("Consider enabling ADOMs if managing devices across multiple organisations or segments")
-        if max_adoms:
-            info(f"Max Admin Domains (if enabled): {max_adoms.strip()}")
-
-
 CHECKS = [
-    ("System Status", check_system_status),
-    ("Security Config", check_security_config),
-    ("VM License", check_vm_license),
-    ("Performance", check_performance),
-    ("Sizing Adequacy", check_sizing),
-    ("Managed Devices", check_devices),
-    ("NTP", check_ntp),
-    ("High Availability", check_ha),
-    ("Crash Log", check_crash_log),
-    ("ADOM List", check_adoms),
-    ("License List", check_license_list),
-    ("Flash Disk", check_flash),
-    ("Task History", check_tasks),
-    ("CDB Upgrade History", check_cdb_upgrade),
-    ("FDS Sizing", check_fds_sizing),
-    ("Kernel Log", check_klog),
+    ("System Status",        check_system_status),
+    ("VM License",           check_vm_license),
+    ("Performance",          check_performance),
+    ("Sizing Adequacy",      check_sizing),
+    ("CDB Upgrade History",  check_cdb_upgrade),
+    ("FDS Sizing",           check_fds_sizing),
+    ("FAZ Log Rate",         check_faz_lograte),
+    ("Kernel Log",           check_klog),
 ]
 
 
@@ -1081,18 +763,48 @@ def main():
         sys.exit(1)
 
     path = sys.argv[1]
-    print()
-    print("FortiManager TAC Report Health Check")
-    print("-" * 40)
-    print(f"  File: {path}")
-
     text = load(path)
+
+    status_block  = section_text(text, "### get system status")
+    platform_full = first_match(r"^Platform Full Name\s*:\s*(.+)$", status_block, re.MULTILINE) or ""
+    platform_type = first_match(r"^Platform Type\s*:\s*(.+)$",      status_block, re.MULTILINE) or ""
+
+    product = "FortiAnalyzer" if "FortiAnalyzer" in platform_full else "FortiManager"
+    is_vm   = "-VM" in platform_type.upper()
+
+    if is_vm:
+        plat_upper = platform_full.upper()
+        if   "KVM"    in plat_upper: vm_plat = "KVM"
+        elif "XEN"    in plat_upper: vm_plat = "XEN"
+        elif "HV"     in plat_upper: vm_plat = "Hyper-V"
+        elif "AWS"    in plat_upper: vm_plat = "AWS"
+        elif "AZURE"  in plat_upper: vm_plat = "Azure"
+        elif "GCP"    in plat_upper: vm_plat = "GCP"
+        else:                         vm_plat = "VM"
+        klog_block = section_text(text, "### diag debug klog")
+        hv_m = re.search(r"Hypervisor detected:\s*(\S+)", klog_block, re.IGNORECASE)
+        if hv_m:
+            hv_map = {"vmware": "VMware", "kvm": "KVM", "xen": "XEN",
+                      "hyperv": "Hyper-V", "hyper-v": "Hyper-V",
+                      "microsoft": "Hyper-V", "aws": "AWS",
+                      "azure": "Azure", "google": "GCP"}
+            vm_plat = hv_map.get(hv_m.group(1).lower().rstrip(".,"), hv_m.group(1))
+        plat_label = f"on {vm_plat}"
+    else:
+        plat_label = "Hardware Appliance"
+
+    title_line = f"{product} TAC Report Health Check  [{platform_type} {plat_label}]"
+
+    print()
+    print(title_line)
+    print("by Farhan Ahmed - ETAC-AMER")
+    print("-" * max(40, len(title_line)))
+    print(f"  File: {path}")
     print(f"  Size: {len(text):,} chars  /  {text.count(chr(10)):,} lines")
 
-    # Track crit/warn counts by intercepting print output per section
     import io, contextlib
 
-    results = {}  # label -> (crits, warns, exception_msg)
+    results = {}
     for label, fn in CHECKS:
         buf = io.StringIO()
         try:
@@ -1100,9 +812,7 @@ def main():
                 fn(text)
             output = buf.getvalue()
             print(output, end="")
-            crits = output.count("[CRIT]")
-            warns = output.count("[WARN]")
-            results[label] = (crits, warns, None)
+            results[label] = (output.count("[CRIT]"), output.count("[WARN]"), None)
         except KeyboardInterrupt:
             print("\n  Interrupted")
             break
