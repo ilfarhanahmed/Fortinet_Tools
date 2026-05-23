@@ -147,20 +147,36 @@ def get_section(text, start_text):
 
     return text[start:end]
 
-
 def get_config_block(text, start_text):
-
     start = text.find(start_text)
 
     if start == -1:
         return ""
 
-    end = text.find("\nend\n", start)
+    lines = text[start:].splitlines()
 
-    if end == -1:
-        return text[start:]
+    depth = 0
+    collected = []
 
-    return text[start:end]
+    for line in lines:
+        stripped = line.strip()
+
+        collected.append(line)
+
+        # entering config block
+        if stripped.startswith("config "):
+            depth += 1
+
+        # leaving config block
+        elif stripped == "end":
+            depth -= 1
+
+            # reached original config end
+            if depth == 0:
+                break
+
+    return "\n".join(collected)
+
 
 
 def find_value(pattern, text):
