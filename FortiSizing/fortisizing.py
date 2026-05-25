@@ -446,46 +446,424 @@ def check_fmg(text, is_vm):
         req_ram
     )
 
-    return healthy
+    return healthy, devices, req_ram
 
 
 # =========
 # FDS CHECK
 # =========
 
-def check_fds(text):
+# FortiGuard preload database sizes (GB) as of Jan 2026
+# https://docs.fortinet.com/document/fortimanager/8.0.0/best-practices/14860/fortimanager-performance-and-sizing-in-closed-networks
+
+FDS_DATABASES = {
+    "wf": 13,
+    "iot": 18,
+    "fq": 5,
+    "as": 0.5,
+    "av": 0.5,
+}
+
+
+RECOMMENDATIONS = []
+def recommend(msg):
+
+    if msg not in RECOMMENDATIONS:
+
+        RECOMMENDATIONS.append(msg)
+
+def check_fds(text, devices, req_ram):
 
     section("FDS SIZING")
 
-    service_section = get_section(
+    #
+    # Runtime FortiGuard services
+    #
+
+    fgd_section = get_section(
         text,
         "### diag fmupdate view-service-info fgd"
     )
 
-    if not service_section:
-        info("FDS service info not found")
-        return
+    fds_section = get_section(
+        text,
+        "### diag fmupdate view-service-info fds"
+    )
 
-    enabled = []
+    service_section = (
+        fgd_section + "\n" + fds_section
+    )
+
+    if not service_section.strip():
+
+        info("FDS service info not found")
+        return True
+
+    enabled_services = []
 
     for line in service_section.splitlines():
 
         line = line.strip()
 
-        if line.endswith(": on"):
-            enabled.append(line)
+        match = re.search(
+            r"^(.*?):\s*on$",
+            line,
+            re.IGNORECASE
+        )
 
-    if not enabled:
-        ok("FMG is not acting as local FDS")
-        return
+        if match:
 
-    info("FMG is acting as local FDS")
+            service = match.group(1).strip()
+
+            #
+            # Avoid duplicates
+            #
+
+            if service not in enabled_services:
+
+                enabled_services.append(service)
+
+    #
+    # No active services
+    #
+
+    if not enabled_services:
+
+        ok("No active FortiGuard services detected")
+        return True
+
+    #
+    # Runtime status
+    #
+
+    info(
+        "FMG has active FortiGuard services"
+    )
 
     print()
 
-    for service in enabled:
-        ok(service)
+    for service in enabled_services:
 
+        ok(f"{service} : on")
+
+    #
+    # Parse preload settings
+    #
+
+    fgd_config = get_config_block(
+        text,
+        "config fmupdate fgd-setting"
+    )
+
+    preload_names = [
+        "wf",
+        "iot",
+        "fq",
+        "as",
+        "av",
+    ]
+
+    preload_state = {}
+
+    for preload in preload_names:
+
+        enable_pattern = (
+            rf"set\s+{preload}-preload\s+enable"
+        )
+
+        disable_pattern = (
+            rf"set\s+{preload}-preload\s+disable"
+        )
+
+        if re.search(
+            enable_pattern,
+            fgd_config
+        ):
+
+            preload_state[preload] = "enabled"
+
+        elif re.search(
+            disable_pattern,
+            fgd_config
+        ):
+
+            preload_state[preload] = "disabled"
+
+        else:
+
+            preload_state[preload] = "default"
+
+    #
+    # Display preload state
+    #
+
+    print()
+
+    info("Preload Configuration")
+
+    print(
+        "WF=WebFilter  "
+        "IOT=IoT  "
+        "FQ=File Query  "
+        "AS=Antispam  "
+        "AV=Antivirus"
+    )
+
+    print()
+
+    for preload, state in preload_state.items():
+
+        if state == "enabled":
+
+            print(
+                f"{preload.upper():<6}: ENABLED"
+            )
+
+        else:
+
+            print(
+                f"{preload.upper():<6}: disabled"
+            )
+
+    #
+    # Determine enabled preload databases
+    #
+
+    enabled_preloads = []
+
+    for preload, state in preload_state.items():
+
+        if state == "enabled":
+
+            enabled_preloads.append(preload)
+
+    #
+    # No explicit preload warning
+    #
+
+    if not enabled_preloads:
+
+        print()
+
+        warn(
+            "No explicit preload services enabled"
+        )
+
+        warn(
+            "Disabled preload reduces RAM usage "
+            "but increases disk I/O wait and CPU usage"
+        )
+
+    #
+    # Official Fortinet RAM formula
+    #
+    # VMtotal GB =
+    # FMGreq + 2 ×
+    # (WFdb + IOTdb + FQdb + ASdb + AVQdb)
+    #
+
+    preload_total = 0
+
+    for preload in enabled_preloads:
+
+        preload_total += FDS_DATABASES.get(
+            preload,
+            0
+        )
+
+    additional_ram = (
+        2 * preload_total
+    )
+
+    required_ram = (
+        req_ram + additional_ram
+    )
+
+    print()
+
+    info(
+        f"Base FMG RAM Requirement : "
+        f"{req_ram} GB"
+    )
+
+    info(
+        f"Additional FDS RAM : "
+        f"{additional_ram:.1f} GB"
+    )
+
+    info(
+        f"Total Recommended RAM : "
+        f"{required_ram:.1f} GB"
+    )
+
+    #
+    # Validate actual RAM
+    #
+
+    cpu, ram, disk = get_resources(text)
+
+    print()
+
+    info(f"Detected RAM : {ram:.1f} GB")
+
+    healthy = True
+
+    if ram < required_ram:
+
+        crit(
+            "RAM below Fortinet recommended "
+            "FDS sizing"
+        )
+
+        recommend(
+            "Increase VM RAM to meet "
+            f"recommended sizing ({required_ram:.1f} GB)"
+        )
+
+        healthy = False
+
+    else:
+
+        ok(
+            "RAM meets Fortinet recommended "
+            "FDS sizing"
+        )
+
+    #
+    # WebFilter recommendation
+    #
+
+    wf_state = preload_state.get("wf")
+
+    if (
+        ram >= 60
+        and wf_state == "disabled"
+    ):
+
+        print()
+
+        warn(
+            "WebFilter preload disabled on "
+            "high-memory deployment"
+        )
+        recommend(
+            "Enable WebFilter preload "
+	        "for high-memory deployments"
+        )
+
+
+    #
+    # Parse max-work
+    #
+
+    fds_config = get_config_block(
+        text,
+        "config fmupdate fds-setting"
+    )
+
+    max_work = find_value(
+        r"set\s+max-work\s+(\d+)",
+        fds_config
+    )
+
+    print()
+
+    #
+    # Default FMG value is 1
+    #
+
+    if max_work:
+
+        max_work = int(max_work)
+
+        info(
+            f"Configured max-work : "
+            f"{max_work}"
+        )
+
+    else:
+
+        max_work = 1
+
+        info(
+            "Configured max-work : "
+            "default (1)"
+        )
+
+    #
+    # Fortinet recommendations
+    #
+
+    if devices <= 50:
+
+        recommended = 1
+        recommendation_reason = "small deployment"
+
+    elif devices <= 1000:
+
+        recommended = 10
+        recommendation_reason = "medium deployment"
+
+    else:
+
+        recommended = 24
+        recommendation_reason = "large deployment"
+
+    info(
+        f"Recommended max-work : "
+        f"{recommended} "
+        f"({recommendation_reason})"
+    )
+
+    if max_work < recommended:
+
+        warn(
+			"Configured max-work below "
+			"recommended value"
+		)
+
+        recommend(
+            f"Increase max-work to "
+            f"{recommended}"
+        )
+
+    else:
+
+        ok(
+            "max-work setting looks good"
+        )
+
+    #
+    # Platform limitations
+    #
+
+    status = get_section(
+        text,
+        "### get system status"
+    )
+
+    platform = find_value(
+        r"Platform Type\s*:\s*(.+)",
+        status
+    ) or ""
+
+    if (
+        "FMG-300E" in platform
+        and enabled_preloads
+    ):
+
+        print()
+
+        warn(
+            "FMG-300E may be insufficient "
+            "for heavy preload workloads"
+        )
+        recommend(
+            "Consider larger FMG platform "
+            "for heavy preload workloads"
+        )
+
+    return healthy
 
 # ===========
 # FAZ SIZING
@@ -680,18 +1058,44 @@ def check_faz(text, is_vm):
 
 
 # =============
-# FINAL RESULT
+# FINAL RESULT / TL;DR
 # =============
 
 def final_result(product, healthy):
 
-    section("FINAL RESULT")
+    section("TL;DR")
+
+    #
+    # Overall status
+    #
 
     if healthy:
-        ok(f"{product} sizing looks GOOD")
-    else:
-        crit(f"{product} sizing is NOT sufficient")
 
+        ok(f"{product} sizing looks GOOD")
+
+    else:
+
+        crit(
+            f"{product} sizing is NOT sufficient"
+        )
+
+    #
+    # Recommendations
+    #
+
+    if RECOMMENDATIONS:
+
+        print()
+
+
+        for index, item in enumerate(
+            RECOMMENDATIONS,
+            start=1
+        ):
+
+            print(
+                f"{index}. {item}"
+            )
 
 # ======
 # MAIN
@@ -701,7 +1105,10 @@ def main():
 
     if len(sys.argv) < 2:
 
-        print(f"Usage: python3 {sys.argv[0]} <tac_report>")
+        print(
+            f"Usage: python3 {sys.argv[0]} <tac_report>"
+        )
+
         sys.exit(1)
 
     file_path = sys.argv[1]
@@ -710,7 +1117,11 @@ def main():
 
     platform, is_faz, is_vm = detect_product(text)
 
-    product = "FortiAnalyzer" if is_faz else "FortiManager"
+    product = (
+        "FortiAnalyzer"
+        if is_faz
+        else "FortiManager"
+    )
 
     print()
     print("=" * 50)
@@ -723,20 +1134,54 @@ def main():
 
     check_system_status(text)
 
+    #
+    # FAZ
+    #
+
     if is_faz:
 
-        healthy = check_faz(text, is_vm)
+        healthy = check_faz(
+            text,
+            is_vm
+        )
+
+    #
+    # FMG
+    #
 
     else:
 
-        healthy = check_fmg(text, is_vm)
+        healthy, devices, req_ram = check_fmg(
+            text,
+            is_vm
+        )
 
-        check_fds(text)
+        fds_healthy = check_fds(
+            text,
+            devices,
+            req_ram
+        )
 
-    final_result(product, healthy)
+        #
+        # Combine FMG + FDS health
+        #
+
+        healthy = (
+            healthy and fds_healthy
+        )
+
+    #
+    # Final TL;DR
+    #
+
+    final_result(
+        product,
+        healthy
+    )
 
     print()
 
 
 if __name__ == "__main__":
+
     main()
