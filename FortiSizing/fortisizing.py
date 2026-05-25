@@ -1023,9 +1023,9 @@ def final_result(product, healthy):
             )
 
 
-# ======
+# =====
 # MAIN
-# ======
+# =====
 
 def main():
     if len(sys.argv) < 2:
@@ -1059,44 +1059,20 @@ def main():
     check_system_status(text)
 
     # FAZ
-
     if is_faz:
-
-        healthy = check_faz(
-            text,
-            is_vm
-        )
+        healthy = check_faz(text,is_vm)
 
     # FMG
-
     else:
-
-        healthy, devices, req_ram = check_fmg(
-            text,
-            is_vm
-        )
-
-        fds_healthy = check_fds(
-            text,
-            devices,
-            req_ram
-        )
-
+        healthy, devices, req_ram = check_fmg(text,is_vm)
+        fds_healthy = check_fds(text,devices,req_ram)
         # Combine FMG + FDS health
-
-        healthy = (
-                healthy and fds_healthy
-        )
+        healthy = (healthy and fds_healthy)
 
     # Final TL;DR
-
-    final_result(
-        product,
-        healthy
-    )
+    final_result(product,healthy)
 
     print()
-
 
 if __name__ == "__main__":
     main()
