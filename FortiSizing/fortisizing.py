@@ -9,42 +9,42 @@ TAC reports and validates system sizing based on Fortinet
 recommended deployment guidelines.
 
 Checks Performed
-----------------
+--------------------
 
 1. System Status
-   - Platform information
-   - Firmware version
-   - Serial number
-   - Hostname
-   - HA mode
-   - ADOM configuration
-   - FIPS mode
-   - License status
+- Platform information
+- Firmware version
+- Serial number
+- Hostname
+- HA mode
+- ADOM configuration
+- FIPS mode
+- License status
 
 2. FMG Sizing
-   - Managed device count
-   - VM CPU / RAM / Disk validation
-   - Tier utilization check
+- Managed device count
+- VM CPU / RAM / Disk validation
+- Tier utilization check
 
 3. FAZ Sizing
-   - Licensed log rates
-   - Actual log receive rate
-   - Forwarder impact calculation
-   - Effective sizing rate
-   - VM CPU / RAM / Disk validation
-   - Required storage IOPS reference
+- Licensed log rates
+- Actual log receive rate
+- Forwarder impact calculation
+- Effective sizing rate
+- VM CPU / RAM / Disk validation
+- Required storage IOPS reference
 
 4. FDS Sizing (FMG Only)
-   - FortiGuard Distribution Server detection
-   - Enabled rating services
-   - FDS RAM requirement calculation
-   - max-work recommendation validation
+- FortiGuard Distribution Server detection
+- Enabled rating services
+- FDS RAM requirement calculation
+- max-work recommendation validation
 
 Sizing References
------------------
+--------------------
 
 FMG:
-https://docs.fortinet.com/document/fortimanager-private-cloud/7.6.0/kvm-administration-guide/583600/minimum-system-requirements
+https://docs.fortinet.com/document/fortimanager-private-cloud/8.0.0/kvm-administration-guide/583600/minimum-system-requirements
 
 FAZ:
 https://docs.fortinet.com/document/fortianalyzer-private-cloud/8.0.0/kvm-administration-guide/583600/minimum-system-requirements
@@ -120,7 +120,6 @@ FAZ_SIZING = [
 # ============
 
 def load_file(path):
-
     try:
         text = Path(path).read_text(errors="replace")
         text = re.sub(r"\x1b\[[0-9;]*m", "", text)
@@ -131,15 +130,13 @@ def load_file(path):
         sys.exit(1)
 
 
+# Section from TAC report ###
 def get_section(text, start_text):
-
     start = text.find(start_text)
 
     if start == -1:
         return ""
-
     start += len(start_text)
-
     end = text.find("### ", start)
 
     if end == -1:
@@ -147,6 +144,8 @@ def get_section(text, start_text):
 
     return text[start:end]
 
+
+# config block
 def get_config_block(text, start_text):
     start = text.find(start_text)
 
@@ -178,40 +177,30 @@ def get_config_block(text, start_text):
     return "\n".join(collected)
 
 
-
 def find_value(pattern, text):
-
     match = re.search(pattern, text, re.MULTILINE)
-
     if match:
         return match.group(1).strip()
-
     return None
 
 
 def kb_to_gb(kb):
-
     kb = kb.replace(",", "")
-
     return float(kb) / 1024 / 1024
 
 
 def get_required_tier(value, table):
-
     for row in table:
-
         if value <= row[0]:
             return row
-
     return table[-1]
 
 
 # ==================
 # PRODUCT DETECTION
-# ==================
+# =================
 
 def detect_product(text):
-
     status = get_section(
         text,
         "### get system status"
@@ -257,7 +246,6 @@ def detect_product(text):
 # =================
 
 def get_resources(text):
-
     cpu_section = get_section(
         text,
         "### diag system print cpuinfo"
@@ -302,12 +290,11 @@ def get_resources(text):
     return cpu, ram, disk
 
 
-# =================
+# ===================
 # VM RESOURCE CHECK
-# =================
+# ===================
 
 def check_vm_resources(cpu, ram, disk, req_cpu, req_ram):
-
     healthy = True
 
     print()
@@ -344,7 +331,6 @@ def check_vm_resources(cpu, ram, disk, req_cpu, req_ram):
 # ==============
 
 def check_system_status(text):
-
     section("SYSTEM STATUS")
 
     status = get_section(
@@ -381,7 +367,6 @@ def check_system_status(text):
 # ==========
 
 def check_fmg(text, is_vm):
-
     section("FMG SIZING")
 
     dvm = get_section(
@@ -428,7 +413,6 @@ def check_fmg(text, is_vm):
         ok(f"Tier utilization healthy ({usage:.1f}%)")
 
     if not is_vm:
-
         print()
         info("Hardware appliance detected")
         info("Check hardware datasheet:")
@@ -454,7 +438,7 @@ def check_fmg(text, is_vm):
 # =========
 
 # FortiGuard preload database sizes (GB) as of Jan 2026
-# https://docs.fortinet.com/document/fortimanager/8.0.0/best-practices/14860/fortimanager-performance-and-sizing-in-closed-networks
+# Refer: https://docs.fortinet.com/document/fortimanager/8.0.0/best-practices/14860/fortimanager-performance-and-sizing-in-closed-networks
 
 FDS_DATABASES = {
     "wf": 13,
@@ -464,21 +448,18 @@ FDS_DATABASES = {
     "av": 0.5,
 }
 
-
 RECOMMENDATIONS = []
+
+
 def recommend(msg):
-
     if msg not in RECOMMENDATIONS:
-
         RECOMMENDATIONS.append(msg)
 
-def check_fds(text, devices, req_ram):
 
+def check_fds(text, devices, req_ram):
     section("FDS SIZING")
 
-    #
     # Runtime FortiGuard services
-    #
 
     fgd_section = get_section(
         text,
@@ -491,11 +472,10 @@ def check_fds(text, devices, req_ram):
     )
 
     service_section = (
-        fgd_section + "\n" + fds_section
+            fgd_section + "\n" + fds_section
     )
 
     if not service_section.strip():
-
         info("FDS service info not found")
         return True
 
@@ -515,26 +495,17 @@ def check_fds(text, devices, req_ram):
 
             service = match.group(1).strip()
 
-            #
             # Avoid duplicates
-            #
 
             if service not in enabled_services:
-
                 enabled_services.append(service)
 
-    #
     # No active services
-    #
-
     if not enabled_services:
-
         ok("No active FortiGuard services detected")
         return True
 
-    #
     # Runtime status
-    #
 
     info(
         "FMG has active FortiGuard services"
@@ -543,12 +514,9 @@ def check_fds(text, devices, req_ram):
     print()
 
     for service in enabled_services:
-
         ok(f"{service} : on")
 
-    #
     # Parse preload settings
-    #
 
     fgd_config = get_config_block(
         text,
@@ -576,15 +544,15 @@ def check_fds(text, devices, req_ram):
         )
 
         if re.search(
-            enable_pattern,
-            fgd_config
+                enable_pattern,
+                fgd_config
         ):
 
             preload_state[preload] = "enabled"
 
         elif re.search(
-            disable_pattern,
-            fgd_config
+                disable_pattern,
+                fgd_config
         ):
 
             preload_state[preload] = "disabled"
@@ -593,9 +561,7 @@ def check_fds(text, devices, req_ram):
 
             preload_state[preload] = "default"
 
-    #
     # Display preload state
-    #
 
     print()
 
@@ -625,24 +591,18 @@ def check_fds(text, devices, req_ram):
                 f"{preload.upper():<6}: disabled"
             )
 
-    #
     # Determine enabled preload databases
-    #
 
     enabled_preloads = []
 
     for preload, state in preload_state.items():
 
         if state == "enabled":
-
             enabled_preloads.append(preload)
 
-    #
     # No explicit preload warning
-    #
 
     if not enabled_preloads:
-
         print()
 
         warn(
@@ -654,30 +614,17 @@ def check_fds(text, devices, req_ram):
             "but increases disk I/O wait and CPU usage"
         )
 
-    #
-    # Official Fortinet RAM formula
-    #
-    # VMtotal GB =
-    # FMGreq + 2 ×
-    # (WFdb + IOTdb + FQdb + ASdb + AVQdb)
-    #
+    # Official RAM formula
+    # VMtotal GB = FMGreq + 2 × (WFdb + IOTdb + FQdb + ASdb + AVQdb)
 
     preload_total = 0
 
     for preload in enabled_preloads:
+        preload_total += FDS_DATABASES.get(preload, 0)
 
-        preload_total += FDS_DATABASES.get(
-            preload,
-            0
-        )
+    additional_ram = (2 * preload_total)
 
-    additional_ram = (
-        2 * preload_total
-    )
-
-    required_ram = (
-        req_ram + additional_ram
-    )
+    required_ram = (req_ram + additional_ram)
 
     print()
 
@@ -696,9 +643,7 @@ def check_fds(text, devices, req_ram):
         f"{required_ram:.1f} GB"
     )
 
-    #
     # Validate actual RAM
-    #
 
     cpu, ram, disk = get_resources(text)
 
@@ -729,17 +674,14 @@ def check_fds(text, devices, req_ram):
             "FDS sizing"
         )
 
-    #
     # WebFilter recommendation
-    #
 
     wf_state = preload_state.get("wf")
 
     if (
-        ram >= 60
-        and wf_state == "disabled"
+            ram >= 60
+            and wf_state == "disabled"
     ):
-
         print()
 
         warn(
@@ -748,13 +690,10 @@ def check_fds(text, devices, req_ram):
         )
         recommend(
             "Enable WebFilter preload "
-	        "for high-memory deployments"
+            "for high-memory deployments"
         )
 
-
-    #
     # Parse max-work
-    #
 
     fds_config = get_config_block(
         text,
@@ -768,9 +707,7 @@ def check_fds(text, devices, req_ram):
 
     print()
 
-    #
     # Default FMG value is 1
-    #
 
     if max_work:
 
@@ -790,9 +727,7 @@ def check_fds(text, devices, req_ram):
             "default (1)"
         )
 
-    #
     # Fortinet recommendations
-    #
 
     if devices <= 50:
 
@@ -818,9 +753,9 @@ def check_fds(text, devices, req_ram):
     if max_work < recommended:
 
         warn(
-			"Configured max-work below "
-			"recommended value"
-		)
+            "Configured max-work below "
+            "recommended value"
+        )
 
         recommend(
             f"Increase max-work to "
@@ -833,9 +768,7 @@ def check_fds(text, devices, req_ram):
             "max-work setting looks good"
         )
 
-    #
     # Platform limitations
-    #
 
     status = get_section(
         text,
@@ -848,10 +781,9 @@ def check_fds(text, devices, req_ram):
     ) or ""
 
     if (
-        "FMG-300E" in platform
-        and enabled_preloads
+            "FMG-300E" in platform
+            and enabled_preloads
     ):
-
         print()
 
         warn(
@@ -865,12 +797,12 @@ def check_fds(text, devices, req_ram):
 
     return healthy
 
-# ===========
+
+# =========
 # FAZ SIZING
-# ===========
+# =========
 
 def check_faz(text, is_vm):
-
     section("FAZ SIZING")
 
     limits = get_section(
@@ -1062,12 +994,9 @@ def check_faz(text, is_vm):
 # =============
 
 def final_result(product, healthy):
+    section("FINAL RESULT")
 
-    section("TL;DR")
-
-    #
     # Overall status
-    #
 
     if healthy:
 
@@ -1079,32 +1008,27 @@ def final_result(product, healthy):
             f"{product} sizing is NOT sufficient"
         )
 
-    #
     # Recommendations
-    #
 
     if RECOMMENDATIONS:
 
         print()
 
-
         for index, item in enumerate(
-            RECOMMENDATIONS,
-            start=1
+                RECOMMENDATIONS,
+                start=1
         ):
-
             print(
                 f"{index}. {item}"
             )
+
 
 # ======
 # MAIN
 # ======
 
 def main():
-
     if len(sys.argv) < 2:
-
         print(
             f"Usage: python3 {sys.argv[0]} <tac_report>"
         )
@@ -1134,9 +1058,7 @@ def main():
 
     check_system_status(text)
 
-    #
     # FAZ
-    #
 
     if is_faz:
 
@@ -1145,9 +1067,7 @@ def main():
             is_vm
         )
 
-    #
     # FMG
-    #
 
     else:
 
@@ -1162,17 +1082,13 @@ def main():
             req_ram
         )
 
-        #
         # Combine FMG + FDS health
-        #
 
         healthy = (
-            healthy and fds_healthy
+                healthy and fds_healthy
         )
 
-    #
     # Final TL;DR
-    #
 
     final_result(
         product,
@@ -1183,5 +1099,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
