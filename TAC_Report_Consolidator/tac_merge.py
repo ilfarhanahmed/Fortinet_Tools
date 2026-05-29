@@ -15,4 +15,4 @@ def command_name_from_filename(filename):
 # -----
 # MAIN
 # ------
-print(command_name_from_filename(filename))
+print("### " + command_name_from_filename(filename))
