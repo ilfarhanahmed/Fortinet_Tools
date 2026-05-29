@@ -12,7 +12,7 @@ def command_name_from_filename(filename):
     return command_name[1] # that is the second part of split which is the command.
 
 
-# ------
+# -----
 # MAIN
-# -------
+# ------
 print(command_name_from_filename(filename))
