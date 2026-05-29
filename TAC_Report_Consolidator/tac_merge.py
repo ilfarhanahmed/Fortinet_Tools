@@ -4,45 +4,48 @@
 TAC Report Consolidator
 Author: Farhan Ahmed - www.farhan.ch
 """
+
+import tarfile
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+
 # Header
 # -------
 print("TACMerge")
 print("FortiManager/FortiAnalyzer GUI TAC report command-log merger")
 print("============================")
 
-filename = "6_get system status.log"
-# print(filename[2:])
+
+def timestamp():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def command_name_from_filename(filename):
-    real_name = filename[:-4]  # GUI TAC report files are always ending on .log, hence -4 will work.
-    command_name = real_name.split("_", 1) # splitting the initial number part from filename.
-    return command_name[1] # that is the second part of split which is the command.
+    if filename.endswith(".log"):
+        filename = filename[:-4]  # GUI TAC report files are always ending on .log, hence -4 will work.
+    if "_" in filename:
+        filename = filename.split("_", 1)[1] # splitting the initial number part from filename.
+    return filename
 
+# --------------------------------------------------
 
-from pathlib import Path
+archive = "tac_report.tar.gz"
 
-# Read TAC Report
-# -----------------
-file1 = "6_get system status.log"
-file_path = Path("6_get system status.log")
-content1 = file_path.read_text(encoding="utf-8")
+with tarfile.open(archive, "r:*") as tar:
+    for member in tar.getmembers():
+        filename = PurePosixPath(member.name).name
 
-file2 = "7_get system global.log"
-file_path2 = Path("7_get system global.log")
-content2 = file_path2.read_text(encoding="utf-8")
+        if filename.endswith(".log"):
+            file_obj = tar.extractfile(member)
 
-# Create consolidated file
-# -------------------------
-output_file = Path("Merged_TAC_Report.txt")
+            if file_obj:
+                data = file_obj.read()
+                text = data.decode("utf-8", errors="replace")
+                print (text)
+                break
 
-with open(output_file, "w", encoding="utf-8") as out:
-    out.write("### " + command_name_from_filename(file1) + "\n")
-    out.write(content1 + "\n")
-    out.write("\n### " + command_name_from_filename(file2) + "\n")
-    out.write(content2 + "\n")
 
 
 # -----
 # MAIN
 # ------
-print("### " + command_name_from_filename(filename))
+print("\n### " + (filename))
