@@ -1,22 +1,18 @@
 
 print("TACMerge")
 print("FortiManager/FortiAnalyzer GUI TAC report command-log merger")
+print("============================")
 
 filename = "6_get system status.log"
 # print(filename[2:])
 
-def remove_log_extension(filename):
-    realname = filename[:-4]
-    return realname
+def command_name_from_filename(filename):
+    realname = filename[:-4]  # GUI TAC report files are always ending on .log, hence -4 will work.
+    command_name = realname.split("_", 1) # splitting the initial number part from filename.
+    return command_name[1] # that is the second part of split which is the command.
 
-def remove_num_prefix(filename):
-    parts = filename.split("_", 1)
-    if len(parts) == 2:
-        return parts[1]
-
-    return filename
 
 # ------
 # MAIN
 # -------
-print(remove_log_extension(remove_num_prefix(filename)))
+print(command_name_from_filename(filename))
