@@ -41,7 +41,7 @@ parser.add_argument(
 # Output directory is optional, if not entered default is current dir.
 parser.add_argument(
     "-o",
-    "--output_file",
+    "--output_dir",
     default=".",
     help="Output folder. Default is current directory."
 )
@@ -50,7 +50,7 @@ args = parser.parse_args()
 
 input_file = args.input_file
 # converting to Path.
-output_dir = Path(args.output_file)
+output_dir = Path(args.output_dir)
 # If output_dir does not exist then create it.
 # parents=True  => if parent folders (nested) do not exist then create them too.
 # exist_ok=True => if folder already exist, do not crash.
