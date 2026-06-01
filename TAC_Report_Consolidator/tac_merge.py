@@ -29,6 +29,10 @@ def command_name_from_filename(filename):
         filename = filename.split("_", 1)[1]
     return filename
 
+def command_num(filename):
+    num_part = filename.split("_",1)[0]
+    return int(num_part)
+
 # Adding argparse to select the tar archive file
 parser = argparse.ArgumentParser(
     description="TACMerge - merge FMG/FAZ GUI TAC Report"
