@@ -129,6 +129,39 @@ FAZ_SIZING = [
 
 RECOMMENDATIONS = []
 
+VM_RESOURCE_TOLERANCE_PERCENT = 5
+DISK_REQUIREMENT_GB = 500
+
+FMG_MIN_RESOURCE_URL = (
+    "https://docs.fortinet.com/document/fortimanager-private-cloud/"
+    "8.0.0/kvm-administration-guide/583600/"
+    "minimum-system-requirements"
+)
+
+FAZ_MIN_RESOURCE_URL = (
+    "https://docs.fortinet.com/document/fortianalyzer-private-cloud/"
+    "8.0.0/kvm-administration-guide/583600/"
+    "minimum-system-requirements"
+)
+
+FMG_CLOUD_LIMITATION_URL = (
+    "https://docs.fortinet.com/document/fortimanager-cloud/"
+    "7.6.6/release-notes/865961/"
+    "limitations-of-fortimanager-cloud"
+)
+
+FAZ_CLOUD_LIMITATION_URL = (
+    "https://docs.fortinet.com/document/fortianalyzer-cloud/"
+    "7.6.6/release-notes/407448/"
+    "limitations-of-fortianalyzer-cloud"
+)
+
+FDS_SIZING_URL = (
+    "https://docs.fortinet.com/document/fortimanager/"
+    "8.0.0/best-practices/14860/"
+    "fortimanager-performance-and-sizing-in-closed-networks"
+)
+
 
 # =============
 # FILE HELPERS
@@ -247,6 +280,14 @@ def get_required_tier(value, table):
             return row
 
     return table[-1]
+
+
+def within_tolerance(actual, required):
+    minimum_allowed = required * (
+        1 - VM_RESOURCE_TOLERANCE_PERCENT / 100
+    )
+
+    return actual >= minimum_allowed
 
 
 def is_archive(path):
@@ -428,7 +469,37 @@ def detect_product(text):
         or "FAZ" in all_text
     )
 
-    return platform_type, is_faz, is_vm
+    return platform_type, platform_full, is_faz, is_vm
+
+
+def is_cloud_platform(platform):
+    platform = platform.upper()
+
+    return "CLOUD" in platform
+
+
+def is_fmg_cloud_platform(platform):
+    platform = platform.upper()
+
+    return (
+        is_cloud_platform(platform)
+        and (
+            "FMG" in platform
+            or "FORTIMANAGER" in platform
+        )
+    )
+
+
+def is_faz_cloud_platform(platform):
+    platform = platform.upper()
+
+    return (
+        is_cloud_platform(platform)
+        and (
+            "FAZ" in platform
+            or "FORTIANALYZER" in platform
+        )
+    )
 
 
 # ================
@@ -508,21 +579,39 @@ def check_vm_resources(
         ok(f"CPU meets requirement ({req_cpu})")
 
     if ram < req_ram:
-        crit(f"RAM below requirement ({ram:.1f} < {req_ram} GB)")
+        if within_tolerance(ram, req_ram):
+            ok(
+                f"RAM within {VM_RESOURCE_TOLERANCE_PERCENT}% "
+                f"tolerance ({ram:.1f} GB, required {req_ram} GB)"
+            )
+        else:
+            crit(f"RAM below requirement ({ram:.1f} < {req_ram} GB)")
 
-        if recommend_ram:
-            recommend(f"Increase VM RAM allocation to at least {req_ram} GB")
+            if recommend_ram:
+                recommend(f"Increase VM RAM allocation to at least {req_ram} GB")
 
-        healthy = False
+            healthy = False
     else:
-        ok(f"RAM meets requirement ({req_ram} GB)")
+        ok(f"RAM meets requirement ({ram:.1f} GB)")
 
-    if disk < 500:
-        crit(f"Disk below requirement ({disk:.1f} < 500 GB)")
-        recommend("Increase VM disk size to at least 500 GB")
-        healthy = False
+    if disk < DISK_REQUIREMENT_GB:
+        if within_tolerance(disk, DISK_REQUIREMENT_GB):
+            ok(
+                f"Disk within {VM_RESOURCE_TOLERANCE_PERCENT}% "
+                f"tolerance ({disk:.1f} GB, required {DISK_REQUIREMENT_GB} GB)"
+            )
+        else:
+            crit(
+                f"Disk below requirement "
+                f"({disk:.1f} < {DISK_REQUIREMENT_GB} GB)"
+            )
+            recommend(
+                f"Increase VM disk size to at least "
+                f"{DISK_REQUIREMENT_GB} GB"
+            )
+            healthy = False
     else:
-        ok("Disk meets requirement (500 GB)")
+        ok(f"Disk meets requirement ({disk:.1f} GB)")
 
     return healthy
 
@@ -566,7 +655,7 @@ def check_system_status(text):
 # FMG SIZING
 # ==========
 
-def check_fmg(text, is_vm):
+def check_fmg(text, is_vm, platform_check):
     section("FMG SIZING")
 
     dvm = get_section(
@@ -597,8 +686,9 @@ def check_fmg(text, is_vm):
         f"Required Tier : "
         f"{req_cpu} CPU / "
         f"{req_ram} GB RAM / "
-        f"500 GB Disk"
+        f"{DISK_REQUIREMENT_GB} GB Disk"
     )
+    info(f"Reference: {FMG_MIN_RESOURCE_URL}")
 
     usage = (devices / max_devices) * 100
 
@@ -609,7 +699,22 @@ def check_fmg(text, is_vm):
     else:
         ok(f"Tier utilization healthy ({usage:.1f}%)")
 
+    info(
+        f"Tier utilization is based on managed devices "
+        f"({devices}) divided by the selected tier capacity "
+        f"({max_devices})"
+    )
+
     blank()
+
+    if is_fmg_cloud_platform(platform_check):
+        info("FortiManager Cloud platform detected")
+        info(
+            "VM CPU / RAM / Disk validation skipped because "
+            "resources are managed by FortiManager Cloud"
+        )
+
+        return True, devices, req_ram
 
     if not is_vm:
         info("Hardware appliance detected")
@@ -671,7 +776,10 @@ def check_fds(text, devices, req_ram):
 
         cpu, ram, disk = get_resources(text)
 
-        if ram < req_ram:
+        if (
+            ram < req_ram
+            and not within_tolerance(ram, req_ram)
+        ):
             recommend(f"Increase VM RAM allocation to at least {req_ram} GB")
 
         return True
@@ -798,18 +906,25 @@ def check_fds(text, devices, req_ram):
     healthy = True
 
     if ram < required_ram:
-        crit("RAM below Fortinet recommended FDS sizing")
+        if within_tolerance(ram, required_ram):
+            ok(
+                f"RAM within {VM_RESOURCE_TOLERANCE_PERCENT}% tolerance "
+                f"for Fortinet recommended FDS sizing "
+                f"({ram:.1f} GB, recommended {required_ram:.1f} GB)"
+            )
+        else:
+            crit("RAM below Fortinet recommended FDS sizing")
 
-        # FDS RAM recommendation already includes base FMG RAM.
-        # Remove lower base RAM recommendation to avoid duplicate guidance.
-        remove_recommendation(r"Increase VM RAM allocation")
+            # FDS RAM recommendation already includes base FMG RAM.
+            # Remove lower base RAM recommendation to avoid duplicate guidance.
+            remove_recommendation(r"Increase VM RAM allocation")
 
-        recommend(
-            "Increase VM RAM to meet "
-            f"recommended sizing ({required_ram:.1f} GB)"
-        )
+            recommend(
+                "Increase VM RAM to meet "
+                f"recommended sizing ({required_ram:.1f} GB)"
+            )
 
-        healthy = False
+            healthy = False
     else:
         ok("RAM meets Fortinet recommended FDS sizing")
 
@@ -865,7 +980,15 @@ def check_fds(text, devices, req_ram):
 
     if max_work < recommended:
         warn("Configured max-work below recommended value")
-        recommend(f"Increase max-work to {recommended}")
+        recommend(
+            f"Increase max-work to {recommended}\n\n"
+            "Recommended CLI:\n"
+            "config fmupdate fds-setting\n"
+            f"set max-work {recommended}\n"
+            "end\n\n"
+            "Reference:\n"
+            f"{FDS_SIZING_URL}"
+        )
     else:
         ok("max-work setting looks good")
 
@@ -893,6 +1016,53 @@ def check_fds(text, devices, req_ram):
 # ===========
 # FAZ SIZING
 # ===========
+
+def check_faz_cloud(text, platform_check):
+    section("FAZ CLOUD SIZING")
+
+    info("FortiAnalyzer Cloud platform detected")
+    info(
+        "VM CPU / RAM / Disk validation skipped because "
+        "resources are managed by FortiAnalyzer Cloud"
+    )
+    info(
+        "Use FortiAnalyzer Cloud service quota, storage usage, "
+        "and licensed log rate instead of VM hardware sizing"
+    )
+
+    limits = get_section(
+        text,
+        "### get system loglimits"
+    )
+
+    gbday = find_value(
+        r"GB/day\s*:\s*(.+)",
+        limits
+    )
+
+    peak_raw = find_value(
+        r"Peak Log Rate\s*:\s*(.+)",
+        limits
+    )
+
+    sustained = find_value(
+        r"Sustained Log Rate\s*:\s*(.+)",
+        limits
+    )
+
+    if gbday:
+        info(f"Licensed GB/day         : {gbday}")
+
+    if peak_raw:
+        info(f"Licensed Peak Rate      : {peak_raw}")
+
+    if sustained:
+        info(f"Licensed Sustained Rate : {sustained}")
+
+    info(f"Reference: {FAZ_CLOUD_LIMITATION_URL}")
+
+    return True
+
 
 def check_faz(text, is_vm):
     section("FAZ SIZING")
@@ -1002,6 +1172,7 @@ def check_faz(text, is_vm):
     req_iops = tier[3]
 
     info(f"Required Tier : {req_cpu} CPU / {req_ram} GB RAM")
+    info(f"Reference: {FAZ_MIN_RESOURCE_URL}")
 
     healthy = True
 
@@ -1076,7 +1247,8 @@ def run(path, save_combined=None):
         save_combined=save_combined
     )
 
-    platform, is_faz, is_vm = detect_product(text)
+    platform, platform_full, is_faz, is_vm = detect_product(text)
+    platform_check = f"{platform} {platform_full}"
 
     product = (
         "FortiAnalyzer"
@@ -1087,21 +1259,47 @@ def run(path, save_combined=None):
     section(f"{product} TAC Sizing Tool")
     info(f"File     : {display_name}")
     info(f"Platform : {platform}")
-    info(f"VM       : {is_vm}")
+
+    if is_fmg_cloud_platform(platform_check):
+        info("Deployment : FortiManager Cloud")
+    elif is_faz_cloud_platform(platform_check):
+        info("Deployment : FortiAnalyzer Cloud")
+    else:
+        info(f"VM       : {is_vm}")
 
     check_system_status(text)
 
     # FAZ
     if is_faz:
-        healthy = check_faz(text, is_vm)
+        if is_faz_cloud_platform(platform_check):
+            healthy = check_faz_cloud(
+                text,
+                platform_check
+            )
+        else:
+            healthy = check_faz(text, is_vm)
 
     # FMG
     else:
-        healthy, devices, req_ram = check_fmg(text, is_vm)
-        fds_healthy = check_fds(text, devices, req_ram)
+        healthy, devices, req_ram = check_fmg(
+            text,
+            is_vm,
+            platform_check
+        )
 
-        # Combine FMG + FDS health
-        healthy = (healthy and fds_healthy)
+        if is_fmg_cloud_platform(platform_check):
+            section("FORTIGUARD / FDS CHECK")
+            info("FortiManager Cloud platform detected")
+            info(
+                "FDS sizing check skipped because FortiManager Cloud "
+                "does not provide the FortiGuard update service"
+            )
+            info(f"Reference: {FMG_CLOUD_LIMITATION_URL}")
+        else:
+            fds_healthy = check_fds(text, devices, req_ram)
+
+            # Combine FMG + FDS health
+            healthy = (healthy and fds_healthy)
 
     # Final TL;DR
     final_result(product, healthy)
