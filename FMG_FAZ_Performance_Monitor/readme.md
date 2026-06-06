@@ -20,6 +20,7 @@ A Python terminal monitor for FoetiManager/FortiAnalyzer system performance and 
 /fazsys/monitor/logforward-status
 /fazsys/monitor/logforward-status
 /cli/global/system/performance
+sys./status
 ```
 
 ## Usage
