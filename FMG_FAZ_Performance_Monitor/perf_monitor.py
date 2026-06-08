@@ -24,7 +24,8 @@ STATUS_API_PATH = "sys/status/"
 FAZ_PERF_API_PATH = "/fazsys/monitor/system/performance/status"
 CLI_PERF_API_PATH = "/cli/global/system/performance"
 LOG_FORWARD_API_PATH = "/fazsys/monitor/logforward-status"
-
+TOP_API_PATH = "/cli/global/exec/top"
+IOTOP_API_PATH = "/cli/global/exec/iotop"
 
 def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
@@ -212,6 +213,35 @@ def build_cli_perf_body():
         ]
     }
 
+def build_top_body(top_n=50):
+    return {
+        "id": "6",
+        "method": "exec",
+        "params": [
+            {
+                "url": TOP_API_PATH,
+                "data": {
+                    "top-n": top_n,
+                    "order-by": "cpu-usage"
+                }
+            }
+        ]
+    }
+
+
+def build_iotop_body(top_n=50):
+    return {
+        "id": "7",
+        "method": "exec",
+        "params": [
+            {
+                "url": IOTOP_API_PATH,
+                "data": {
+                    "top-n": top_n
+                }
+            }
+        ]
+    }
 
 def build_log_forward_body():
     return {
@@ -457,10 +487,109 @@ def parse_faz_performance(faz_data):
     }
 
 
-def run_refresh_calls(url, api_key, platform, verify_ssl, timeout):
+def parse_process_rate(value):
+    """
+    Converts values like:
+    0.3
+    0.3%
+    0.00 K/s
+    855.2m
+    90.6m
+    into numeric values where possible.
+    """
+    if value is None:
+        return 0.0
+
+    text = str(value).strip().lower()
+    text = text.replace("%", "").replace("k/s", "").replace("kb/s", "").strip()
+
+    multiplier = 1.0
+
+    if text.endswith("g"):
+        multiplier = 1024.0
+        text = text[:-1]
+    elif text.endswith("m"):
+        multiplier = 1.0
+        text = text[:-1]
+    elif text.endswith("k"):
+        multiplier = 1 / 1024
+        text = text[:-1]
+
+    try:
+        return float(text.replace(",", "")) * multiplier
+    except ValueError:
+        return 0.0
+
+
+def parse_top_processes(top_data, limit=10):
+    """
+    Parses /cli/global/exec/top response.
+    Returns summary and top CPU processes.
+    """
+    if not isinstance(top_data, dict):
+        return {}, []
+
+    processes = top_data.get("lists", [])
+    summary = top_data.get("summary", {})
+
+    rows = []
+
+    for item in processes:
+        cpu_pct = safe_float(item.get("cpu_pct"))
+        mem_pct = safe_float(item.get("mem_pct"))
+
+        rows.append({
+            "pid": item.get("pid", "N/A"),
+            "cmd": item.get("cmd", "N/A"),
+            "state": item.get("state", "N/A"),
+            "cpu_pct": cpu_pct,
+            "mem_pct": mem_pct,
+            "res": item.get("res", "N/A"),
+            "virt": item.get("virt", "N/A")
+        })
+
+    rows.sort(key=lambda row: row["cpu_pct"], reverse=True)
+
+    return summary, rows[:limit]
+
+
+def parse_iotop_processes(iotop_data, limit=10):
+    """
+    Parses /cli/global/exec/iotop response.
+    Returns summary and top disk I/O processes.
+    """
+    if not isinstance(iotop_data, dict):
+        return {}, []
+
+    processes = iotop_data.get("lists", [])
+    summary = iotop_data.get("summary", {})
+
+    rows = []
+
+    for item in processes:
+        disk_read = parse_process_rate(item.get("disk_read"))
+        disk_write = parse_process_rate(item.get("disk_write"))
+
+        rows.append({
+            "pid": item.get("pid", "N/A"),
+            "cmd": item.get("cmd", "N/A"),
+            "disk_read": disk_read,
+            "disk_write": disk_write,
+            "disk_read_text": item.get("disk_read", "0.00 K/s"),
+            "disk_write_text": item.get("disk_write", "0.00 K/s"),
+            "total_io": disk_read + disk_write
+        })
+
+    rows.sort(key=lambda row: row["total_io"], reverse=True)
+
+    return summary, rows[:limit]
+
+def run_refresh_calls(url, api_key, platform, verify_ssl, timeout, show_processes=False, top_n=50):
     tasks = {}
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    max_workers = 5 if show_processes else 3
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         tasks["cli_perf"] = executor.submit(
             fetch_api_data,
             url,
@@ -489,6 +618,25 @@ def run_refresh_calls(url, api_key, platform, verify_ssl, timeout):
                 timeout
             )
 
+        if show_processes:
+            tasks["top"] = executor.submit(
+                fetch_api_data,
+                url,
+                api_key,
+                build_top_body(top_n),
+                verify_ssl,
+                timeout
+            )
+
+            tasks["iotop"] = executor.submit(
+                fetch_api_data,
+                url,
+                api_key,
+                build_iotop_body(top_n),
+                verify_ssl,
+                timeout
+            )
+
         results = {}
         errors = {}
 
@@ -499,7 +647,6 @@ def run_refresh_calls(url, api_key, platform, verify_ssl, timeout):
                 errors[name] = str(e)
 
     return results, errors
-
 
 def print_disk_io_row(name, disk_data):
     iostat = disk_data.get("iostat", {})
@@ -577,6 +724,86 @@ def print_log_forward_status(log_forward_data, color_enabled=True):
         )
 
 
+def print_process_details(top_summary, top_rows, iotop_summary, iotop_rows, color_enabled=True):
+    print()
+    print(bold("Top Processes - CPU", color_enabled))
+    print("-" * 120)
+
+    if top_summary:
+        print(
+            f"Load Avg 1m/5m/15m : "
+            f"{top_summary.get('load_avg_1', 'N/A')} / "
+            f"{top_summary.get('load_avg_5', 'N/A')} / "
+            f"{top_summary.get('load_avg_15', 'N/A')}"
+        )
+
+        print(
+            f"Memory             : "
+            f"Used {top_summary.get('mem_used', 'N/A')} {top_summary.get('mem_unit', '')} / "
+            f"Total {top_summary.get('mem_total', 'N/A')} {top_summary.get('mem_unit', '')} / "
+            f"Free {top_summary.get('mem_free', 'N/A')} {top_summary.get('mem_unit', '')}"
+        )
+
+        print(
+            f"CPU Summary        : "
+            f"us {top_summary.get('us', 'N/A')}% | "
+            f"sy {top_summary.get('sy', 'N/A')}% | "
+            f"id {top_summary.get('id', 'N/A')}%"
+        )
+
+    print()
+    print(f"{'PID':<8} {'CPU %':>8} {'MEM %':>8} {'STATE':>8} {'RES':>10} {'VIRT':>10}  Command")
+    print("-" * 120)
+
+    if not top_rows:
+        print("No top process data returned.")
+    else:
+        for row in top_rows:
+            cpu_pct = row["cpu_pct"]
+            cpu_text = health_color(f"{cpu_pct:.2f}", cpu_pct, color_enabled)
+
+            print(
+                f"{str(row['pid']):<8} "
+                f"{cpu_text:>8} "
+                f"{row['mem_pct']:>8.2f} "
+                f"{str(row['state']):>8} "
+                f"{str(row['res']):>10} "
+                f"{str(row['virt']):>10}  "
+                f"{row['cmd']}"
+            )
+
+    print()
+    print(bold("Top Processes - Disk I/O", color_enabled))
+    print("-" * 120)
+
+    if iotop_summary:
+        print(
+            f"Actual Disk Read/Write : "
+            f"{iotop_summary.get('actual_disk_read', 'N/A')} / "
+            f"{iotop_summary.get('actual_disk_write', 'N/A')}"
+        )
+
+        print(
+            f"Total Disk Read/Write  : "
+            f"{iotop_summary.get('total_disk_read', 'N/A')} / "
+            f"{iotop_summary.get('total_disk_write', 'N/A')}"
+        )
+
+    print()
+    print(f"{'PID':<8} {'Disk Read':>16} {'Disk Write':>16}  Command")
+    print("-" * 120)
+
+    if not iotop_rows:
+        print("No iotop process data returned.")
+    else:
+        for row in iotop_rows:
+            print(
+                f"{str(row['pid']):<8} "
+                f"{str(row['disk_read_text']):>16} "
+                f"{str(row['disk_write_text']):>16}  "
+                f"{row['cmd']}"
+            )
+
 def print_dashboard(
     platform,
     platform_type,
@@ -587,6 +814,11 @@ def print_dashboard(
     faz_parsed,
     log_forward_data,
     errors,
+    show_processes=False,
+    top_summary=None,
+    top_rows=None,
+    iotop_summary=None,
+    iotop_rows=None,
     color_enabled=True
 ):
     terminal_width = shutil.get_terminal_size((120, 30)).columns
@@ -774,8 +1006,19 @@ def print_dashboard(
     if platform == "FAZ":
         print_log_forward_status(log_forward_data, color_enabled=color_enabled)
 
-    print()
-    print("Press Ctrl+C to stop.")
+    if show_processes:
+        print_process_details(
+            top_summary=top_summary or {},
+            top_rows=top_rows or [],
+            iotop_summary=iotop_summary or {},
+            iotop_rows=iotop_rows or [],
+            color_enabled=color_enabled
+        )
+    else:
+        print()
+        print(bold("Process Details", color_enabled))
+        print("-" * line_width)
+        print("Hidden by default. Restart the script and answer 'y' to show top/iotop process details.")
 
 
 def main():
@@ -834,6 +1077,18 @@ def main():
     if not verify_ssl:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+    show_processes = False
+
+    if not args.once:
+        answer = input("Show top/iotop process details? [y/N]: ").strip().lower()
+        show_processes = answer in ("y", "yes")
+    else:
+        answer = input("Show top/iotop process details for this one-time run? [y/N]: ").strip().lower()
+        show_processes = answer in ("y", "yes")
+
+    top_n = 50
+    display_process_limit = 10
+
     try:
         status_data = fetch_api_data(
             url=url,
@@ -862,12 +1117,19 @@ def main():
                 api_key=api_key,
                 platform=platform,
                 verify_ssl=verify_ssl,
-                timeout=args.timeout
+                timeout=args.timeout,
+                show_processes=show_processes,
+                top_n=top_n
             )
 
             cli_parsed = None
             faz_parsed = None
             log_forward_data = None
+
+            top_summary = {}
+            top_rows = []
+            iotop_summary = {}
+            iotop_rows = []
 
             if "cli_perf" in results:
                 cli_parsed = parse_cli_performance(results["cli_perf"])
@@ -877,6 +1139,18 @@ def main():
 
             if "log_forward" in results:
                 log_forward_data = results["log_forward"]
+
+            if "top" in results:
+                top_summary, top_rows = parse_top_processes(
+                    results["top"],
+                    limit=display_process_limit
+                )
+
+            if "iotop" in results:
+                iotop_summary, iotop_rows = parse_iotop_processes(
+                    results["iotop"],
+                    limit=display_process_limit
+                )
 
             clear_screen()
 
@@ -895,6 +1169,11 @@ def main():
                     faz_parsed=faz_parsed,
                     log_forward_data=log_forward_data,
                     errors=errors,
+                    show_processes=show_processes,
+                    top_summary=top_summary,
+                    top_rows=top_rows,
+                    iotop_summary=iotop_summary,
+                    iotop_rows=iotop_rows,
                     color_enabled=color_enabled
                 )
 
