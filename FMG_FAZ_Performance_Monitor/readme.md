@@ -9,6 +9,7 @@ A Python terminal monitor for FoetiManager/FortiAnalyzer system performance and 
 - Memory usage
 - Disk usage
 - Disk I/O utilization
+- Top CPU, memory disk processes
 - Receive and insert lograte - FAZ Only
 - Log forwarding connected/disconnected status - FAZ Only
 - Auto-refresh every few seconds
@@ -20,6 +21,8 @@ A Python terminal monitor for FoetiManager/FortiAnalyzer system performance and 
 /fazsys/monitor/logforward-status
 /fazsys/monitor/logforward-status
 /cli/global/system/performance
+/cli/global/exec/iotop
+/cli/global/exec/top
 sys/status
 ```
 
@@ -64,7 +67,14 @@ Override refresh interval:
 ```python
 python perf_monitor.py --interval 10
 ```
-
+Include top CPU/disk I/O processes:
+```python
+py perf_monitor.py --processes
+```
+Request top 50 processes from the API but display only top 10:
+```python
+py perf_monitor.py --processes --top-n 50 --process-limit 10
+```
 
 ## ⚠️ Security
 

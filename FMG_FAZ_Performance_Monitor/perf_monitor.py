@@ -1058,6 +1058,26 @@ def main():
         help="Disable terminal colors"
     )
 
+    parser.add_argument(
+        "--processes",
+        action="store_true",
+        help="Show top/iotop process details for CPU and disk I/O"
+    )
+
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=50,
+        help="Number of processes to request from top/iotop API. Default: 50"
+    )
+
+    parser.add_argument(
+        "--process-limit",
+        type=int,
+        default=10,
+        help="Number of processes to display in output. Default: 10"
+    )
+
     args = parser.parse_args()
 
     try:
@@ -1077,17 +1097,9 @@ def main():
     if not verify_ssl:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    show_processes = False
-
-    if not args.once:
-        answer = input("Show top/iotop process details? [y/N]: ").strip().lower()
-        show_processes = answer in ("y", "yes")
-    else:
-        answer = input("Show top/iotop process details for this one-time run? [y/N]: ").strip().lower()
-        show_processes = answer in ("y", "yes")
-
-    top_n = 50
-    display_process_limit = 10
+    show_processes = args.processes
+    top_n = args.top_n
+    display_process_limit = args.process_limit
 
     try:
         status_data = fetch_api_data(
