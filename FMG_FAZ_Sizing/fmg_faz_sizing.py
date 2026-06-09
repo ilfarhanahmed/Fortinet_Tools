@@ -182,6 +182,22 @@ def remove_recommendation(pattern):
     ]
 
 
+def recommend_faz_license_action(is_vm, forwarder_count):
+    if is_vm:
+        recommend(
+            "Increase FAZ license or reduce incoming log rate"
+        )
+    else:
+        if forwarder_count > 0:
+            recommend(
+                "Reduce incoming log rate or reduce/stop log forwarding"
+            )
+        else:
+            recommend(
+                "Reduce incoming log rate"
+            )
+
+
 def load_file(path):
     try:
         text = Path(path).read_text(
@@ -267,6 +283,29 @@ def find_value(pattern, text):
         return match.group(1).strip()
 
     return None
+
+
+def parse_rate_limit(value):
+    if not value:
+        return 0, "Unknown"
+
+    value = value.strip()
+
+    if value.lower() == "unlimited":
+        return None, "Unlimited"
+
+    digits = re.sub(
+        r"[^\d]",
+        "",
+        value
+    )
+
+    if not digits:
+        return 0, value
+
+    rate = int(digits)
+
+    return rate, str(rate)
 
 
 def kb_to_gb(kb):
@@ -1017,6 +1056,127 @@ def check_fds(text, devices, req_ram):
 # FAZ SIZING
 # ===========
 
+
+def get_command_sections(text, command):
+    command_pattern = r"\s+".join(
+        re.escape(part)
+        for part in command.split()
+    )
+
+    matches = list(
+        re.finditer(
+            rf"^###\s+{command_pattern}\s*$",
+            text,
+            re.MULTILINE | re.IGNORECASE
+        )
+    )
+
+    sections = []
+
+    for match in matches:
+        start = match.end()
+
+        next_header = re.search(
+            r"^###\s+",
+            text[start:],
+            re.MULTILINE
+        )
+
+        if next_header:
+            end = start + next_header.start()
+        else:
+            end = len(text)
+
+        sections.append(text[start:end])
+
+    return sections
+
+
+def get_faz_actual_log_rate(text):
+    """
+    Return the FAZ actual receive log rate and the source used.
+
+    Preference order:
+    1. diagnose fortilogd lograte
+    2. diag fortilogd lograte
+    3. diagnose/diag fortilogd msgrate
+    4. lograte-total Last Hour fallback
+
+    Reason:
+    Some TAC reports contain both msgrate and lograte. For sizing, prefer
+    fortilogd lograte when present.
+    """
+
+    command_priority = [
+        (
+            "diagnose fortilogd lograte",
+            "diagnose fortilogd lograte last 60 seconds"
+        ),
+        (
+            "diag fortilogd lograte",
+            "diag fortilogd lograte last 60 seconds"
+        ),
+        (
+            "diagnose fortilogd msgrate",
+            "diagnose fortilogd msgrate last 60 seconds"
+        ),
+        (
+            "diag fortilogd msgrate",
+            "diag fortilogd msgrate last 60 seconds"
+        ),
+    ]
+
+    patterns = [
+        r"last\s+60\s+seconds\s*:\s*([\d.]+)",
+        r"last\s+30\s+seconds\s*:\s*([\d.]+)",
+        r"last\s+5\s+seconds\s*:\s*([\d.]+)",
+    ]
+
+    for command, source in command_priority:
+        sections = get_command_sections(
+            text,
+            command
+        )
+
+        # Use the last matching section if the TAC has repeated commands.
+        for section_text in reversed(sections):
+            for pattern in patterns:
+                match = re.search(
+                    pattern,
+                    section_text,
+                    re.IGNORECASE
+                )
+
+                if match:
+                    return float(match.group(1)), source
+
+    total_commands = [
+        "diagnose fortilogd lograte-total",
+        "diag fortilogd lograte-total",
+    ]
+
+    for command in total_commands:
+        sections = get_command_sections(
+            text,
+            command
+        )
+
+        for section_text in reversed(sections):
+            total_match = re.search(
+                r"^\s*:\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*$",
+                section_text,
+                re.MULTILINE
+            )
+
+            if total_match:
+                return (
+                    float(total_match.group(1)),
+                    f"{command} Last Hour"
+                )
+
+    return None, None
+
+
 def check_faz_cloud(text, platform_check):
     section("FAZ CLOUD SIZING")
 
@@ -1057,7 +1217,7 @@ def check_faz_cloud(text, platform_check):
         info(f"Licensed Peak Rate      : {peak_raw}")
 
     if sustained:
-        info(f"Licensed Sustained Rate : {sustained}")
+        info(f"Licensed Sustained Rate : {sustained_display}")
 
     info(f"Reference: {FAZ_CLOUD_LIMITATION_URL}")
 
@@ -1082,58 +1242,32 @@ def check_faz(text, is_vm):
         limits
     )
 
-    sustained = find_value(
+    sustained_raw = find_value(
         r"Sustained Log Rate\s*:\s*(.+)",
         limits
-    ) or "Unknown"
+    )
 
-    if peak_raw:
-        if peak_raw.lower() == "unlimited":
-            peak = None
-            peak_display = "Unlimited"
-        else:
-            peak = int(
-                re.sub(r"[^\d]", "", peak_raw)
-            )
-            peak_display = str(peak)
-    else:
-        peak = 0
-        peak_display = "Unknown"
+    peak, peak_display = parse_rate_limit(
+        peak_raw
+    )
+
+    sustained_rate, sustained_display = parse_rate_limit(
+        sustained_raw
+    )
 
     info(f"Licensed GB/day         : {gbday}")
     info(f"Licensed Peak Rate      : {peak_display}")
-    info(f"Licensed Sustained Rate : {sustained}")
+    info(f"Licensed Sustained Rate : {sustained_display}")
     blank()
 
-    lograte = get_any_section(
-        text,
-        [
-            "### diag fortilogd lograte",
-            "### diagnose fortilogd lograte",
-        ]
-    )
-
-    actual_rate = None
-
-    patterns = [
-        r"last 60 seconds:\s*([\d.]+)",
-        r"last 30 seconds:\s*([\d.]+)",
-        r"last 5 seconds:\s*([\d.]+)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            lograte,
-            re.IGNORECASE
-        )
-
-        if match:
-            actual_rate = float(match.group(1))
-            break
+    actual_rate, actual_rate_source = get_faz_actual_log_rate(text)
 
     if actual_rate is None:
         warn("Could not determine actual log rate")
+        warn(
+            "Checked diagnose/diag fortilogd lograte, "
+            "diagnose/diag fortilogd msgrate, and lograte-total"
+        )
         return False
 
     config = get_config_block(
@@ -1150,6 +1284,7 @@ def check_faz(text, is_vm):
     effective_rate = actual_rate * (1 + forwarder_count)
 
     info(f"Actual Log Rate       : {actual_rate:.0f}")
+    info(f"Actual Rate Source    : {actual_rate_source}")
     info(f"Forwarders Configured : {forwarder_count}")
 
     if forwarder_count > 0:
@@ -1160,6 +1295,32 @@ def check_faz(text, is_vm):
         info(f"Effective Rate    : {effective_rate:.0f} logs/sec")
     else:
         info(f"Effective Rate : {effective_rate:.0f} logs/sec")
+
+    max_supported_rate = FAZ_SIZING[-1][0]
+
+    if effective_rate > max_supported_rate:
+        if is_vm:
+            warn(
+                f"Effective rate exceeds highest VM sizing table entry "
+                f"({effective_rate:.0f} > {max_supported_rate} logs/sec)"
+            )
+            warn(
+                "Validate larger FAZ VM sizing, reduce incoming log rate, "
+                "or reduce log forwarding load"
+            )
+            recommend(
+                "Validate larger FAZ VM sizing, reduce incoming log rate, "
+                "or reduce log forwarding load"
+            )
+        else:
+            info(
+                f"Effective rate exceeds private-cloud sizing table "
+                f"({effective_rate:.0f} > {max_supported_rate} logs/sec)"
+            )
+            info(
+                "Hardware FAZ detected; private-cloud VM tier limit is "
+                "not treated as a sizing failure"
+            )
 
     tier = get_required_tier(
         effective_rate,
@@ -1198,17 +1359,41 @@ def check_faz(text, is_vm):
         info("Check hardware datasheet:")
         info("https://docs.fortinet.com/product/fortianalyzer/hardware")
 
+    # License validation uses effective_rate, not only actual_rate.
+    # If log forwarding is configured, FAZ must process receive + forward load.
+    if sustained_rate is None:
+        ok("Unlimited sustained license detected")
+    elif sustained_rate == 0:
+        warn("Licensed sustained rate unavailable")
+    elif effective_rate > sustained_rate:
+        warn(
+            f"Effective log rate exceeds licensed sustained rate "
+            f"({effective_rate:.0f} > {sustained_rate})"
+        )
+        recommend_faz_license_action(
+            is_vm,
+            forwarder_count
+        )
+    else:
+        ok("Effective log rate within sustained license")
+
     if peak is None:
         ok("Unlimited peak license detected")
     elif peak == 0:
         warn("Licensed peak rate unavailable")
-    elif actual_rate > peak:
-        crit("Actual log rate exceeds license")
-        healthy = False
-    elif actual_rate > peak * 0.8:
-        warn("Actual log rate nearing license limit")
+    elif effective_rate > peak:
+        warn(
+            f"Effective log rate exceeds licensed peak rate "
+            f"({effective_rate:.0f} > {peak})"
+        )
+        recommend_faz_license_action(
+            is_vm,
+            forwarder_count
+        )
+    elif effective_rate > peak * 0.8:
+        warn("Effective log rate nearing licensed peak rate")
     else:
-        ok("Actual log rate within license")
+        ok("Effective log rate within peak license")
 
     return healthy
 
