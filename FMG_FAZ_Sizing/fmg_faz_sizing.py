@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 
 """
 FortiManager / FortiAnalyzer TAC Sizing Tool
@@ -651,15 +651,29 @@ def get_resources(text):
     else:
         ram = 0
 
+    # Disk size can appear in different TAC formats.
+    # Prefer "Hard Disk" from diag hardware info, then fall back to
+    # "Disk Usage" from get system status.
+
     disk_match = re.search(
-        r"Hard Disk:\s*\n\s*Total:\s+([\d,]+)\s*KB",
-        text
+        r"Hard Disk:\s*\r?\n\s*Total:\s*([\d,]+)\s*KB",
+        text,
+        re.IGNORECASE
     )
 
     if disk_match:
         disk = kb_to_gb(disk_match.group(1))
     else:
-        disk = 0
+        disk_usage_match = re.search(
+            r"Disk Usage\s*:\s*Free\s+[\d.]+\s*GB,\s*Total\s+([\d.]+)\s*GB",
+            text,
+            re.IGNORECASE
+        )
+
+        if disk_usage_match:
+            disk = float(disk_usage_match.group(1))
+        else:
+            disk = 0
 
     return cpu, ram, disk
 
