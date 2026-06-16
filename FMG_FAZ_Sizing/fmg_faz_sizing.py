@@ -682,6 +682,15 @@ def get_resources(text):
 # VM RESOURCE CHECK
 # =================
 
+def format_storage_gb(gb):
+    if gb is None:
+        return "Unknown"
+
+    if gb >= 1024:
+        return f"{gb:.1f} GB ({gb / 1024:.2f} TB)"
+
+    return f"{gb:.1f} GB"
+
 def check_vm_resources(
     cpu,
     ram,
@@ -695,7 +704,7 @@ def check_vm_resources(
     blank()
     info(f"Detected CPU  : {cpu}")
     info(f"Detected RAM  : {ram:.1f} GB")
-    info(f"Detected Disk : {disk:.1f} GB")
+    info(f"Detected Disk : {format_storage_gb(disk)}")
     blank()
 
     if cpu < req_cpu:
