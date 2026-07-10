@@ -1,4 +1,4 @@
-# FortiGate Address Group Analyzer
+# FortiGate Address Count Analyzer
 
 A Python desktop tool for analyzing FortiGate configuration backups, logs, and TAC report files.
 
