@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 FortiGate Address and Address Group Analyzer
+by Farhan Ahmed | www.farhan.ch
 
 Features:
 - Opens FortiGate configuration, log, TAC report, .gz, .tar.gz, or .tgz files
