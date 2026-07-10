@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FortiGate Address and Address Group Analyzer v4
+FortiGate Address and Address Group Analyzer v5
 by Farhan Ahmed | www.farhan.ch
 
 Features:
@@ -11,7 +11,9 @@ Features:
 - Detects duplicate direct members within the same group
 - Detects objects used directly or indirectly in multiple groups
 - Detects circular nested-group references
-- Filters an address object and shows direct and inherited group memberships
+- Filters address objects or address groups
+- Shows direct and inherited group memberships
+- Shows the full configuration block of matched address objects and groups
 - Displays results on screen only; no export
 """
 
@@ -30,7 +32,7 @@ from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 
-APP_NAME = "FortiGate Address Group Analyzer v4"
+APP_NAME = "FortiGate Address Group Analyzer v5"
 
 CONFIG_RE = re.compile(r"^\s*config\s+(.+?)\s*$", re.IGNORECASE)
 EDIT_RE = re.compile(r'^\s*edit\s+(?:"([^"]*)"|(\S+))\s*$', re.IGNORECASE)
@@ -50,6 +52,8 @@ class ParsedData:
     groups: dict[str, dict[str, list[str]]] = field(
         default_factory=lambda: defaultdict(dict)
     )
+    address_configs: dict[tuple[str, str], str] = field(default_factory=dict)
+    group_configs: dict[tuple[str, str], str] = field(default_factory=dict)
     selected_file: str = ""
     source_count: int = 0
     matching_source_count: int = 0
@@ -119,25 +123,73 @@ def read_text_sources(path: Path) -> list[tuple[str, str]]:
     return [(path.name, data.decode("utf-8", errors="replace"))]
 
 
+def format_object_block(
+    table_name: str,
+    object_name: str,
+    body_lines: list[str],
+) -> str:
+    lines = [f"config {table_name}", f'    edit "{object_name}"']
+    lines.extend(body_lines)
+    lines.append("    next")
+    lines.append("end")
+    return "\n".join(lines)
+
+
 def parse_source(
     text: str,
-) -> tuple[dict[str, set[str]], dict[str, dict[str, list[str]]]]:
+) -> tuple[
+    dict[str, set[str]],
+    dict[str, dict[str, list[str]]],
+    dict[tuple[str, str], str],
+    dict[tuple[str, str], str],
+]:
     addresses: dict[str, set[str]] = defaultdict(set)
     groups: dict[str, dict[str, list[str]]] = defaultdict(dict)
+    address_configs: dict[tuple[str, str], str] = {}
+    group_configs: dict[tuple[str, str], str] = {}
 
     config_stack: list[str] = []
     current_vdom = "unknown"
-    current_group: str | None = None
+
+    current_object_name: str | None = None
+    current_object_table: str | None = None
+    current_object_body: list[str] = []
+
+    def save_current_object() -> None:
+        nonlocal current_object_name, current_object_table, current_object_body
+
+        if current_object_name is None or current_object_table is None:
+            return
+
+        block = format_object_block(
+            current_object_table,
+            current_object_name,
+            current_object_body,
+        )
+
+        key = (current_vdom, current_object_name)
+
+        if current_object_table == "firewall address":
+            address_configs.setdefault(key, block)
+        elif current_object_table == "firewall addrgrp":
+            group_configs.setdefault(key, block)
+
+        current_object_name = None
+        current_object_table = None
+        current_object_body = []
 
     for raw_line in io.StringIO(text):
         line = raw_line.rstrip("\r\n")
         stripped = line.strip()
 
         if not stripped:
+            if current_object_name is not None:
+                current_object_body.append(line)
             continue
 
         prompt_match = PROMPT_VDOM_RE.match(stripped)
         if prompt_match:
+            save_current_object()
             prompt_vdom = prompt_match.group(1).strip()
             if prompt_vdom and prompt_vdom.lower() != "global":
                 current_vdom = prompt_vdom
@@ -149,15 +201,13 @@ def parse_source(
             continue
 
         if END_RE.match(line):
+            save_current_object()
             if config_stack:
-                ended = config_stack.pop()
-                if ended == "firewall addrgrp":
-                    current_group = None
+                config_stack.pop()
             continue
 
         if NEXT_RE.match(line):
-            if config_stack and config_stack[-1] == "firewall addrgrp":
-                current_group = None
+            save_current_object()
             continue
 
         edit_match = EDIT_RE.match(line)
@@ -167,41 +217,50 @@ def parse_source(
             ).strip()
 
             if config_stack == ["vdom"]:
+                save_current_object()
                 current_vdom = object_name.split("/", 1)[0] or "unknown"
                 continue
 
             if config_stack and config_stack[-1] == "firewall address":
+                save_current_object()
+                current_object_name = object_name
+                current_object_table = "firewall address"
+                current_object_body = []
                 addresses[current_vdom].add(object_name)
                 continue
 
             if config_stack and config_stack[-1] == "firewall addrgrp":
-                current_group = object_name
-                groups[current_vdom].setdefault(current_group, [])
+                save_current_object()
+                current_object_name = object_name
+                current_object_table = "firewall addrgrp"
+                current_object_body = []
+                groups[current_vdom].setdefault(object_name, [])
                 continue
 
-        if (
-            current_group is not None
-            and config_stack
-            and config_stack[-1] == "firewall addrgrp"
-        ):
-            set_match = SET_MEMBER_RE.match(line)
-            if set_match:
-                groups[current_vdom][current_group] = parse_cli_values(
-                    set_match.group(1)
-                )
-                continue
+        if current_object_name is not None:
+            current_object_body.append(line)
 
-            append_match = APPEND_MEMBER_RE.match(line)
-            if append_match:
-                groups[current_vdom][current_group].extend(
-                    parse_cli_values(append_match.group(1))
-                )
-                continue
+            if current_object_table == "firewall addrgrp":
+                set_match = SET_MEMBER_RE.match(line)
+                if set_match:
+                    groups[current_vdom][current_object_name] = parse_cli_values(
+                        set_match.group(1)
+                    )
+                    continue
 
-            if UNSET_MEMBER_RE.match(line):
-                groups[current_vdom][current_group] = []
+                append_match = APPEND_MEMBER_RE.match(line)
+                if append_match:
+                    groups[current_vdom][current_object_name].extend(
+                        parse_cli_values(append_match.group(1))
+                    )
+                    continue
 
-    return addresses, groups
+                if UNSET_MEMBER_RE.match(line):
+                    groups[current_vdom][current_object_name] = []
+
+    save_current_object()
+
+    return addresses, groups, address_configs, group_configs
 
 
 def load_and_parse(path: Path) -> ParsedData:
@@ -213,7 +272,12 @@ def load_and_parse(path: Path) -> ParsedData:
     )
 
     for _, text in sources:
-        source_addresses, source_groups = parse_source(text)
+        (
+            source_addresses,
+            source_groups,
+            source_address_configs,
+            source_group_configs,
+        ) = parse_source(text)
 
         if source_addresses or source_groups:
             result.matching_source_count += 1
@@ -231,6 +295,12 @@ def load_and_parse(path: Path) -> ParsedData:
                     result.groups[vdom][group_name] = list(members)
                 elif existing != members and members:
                     result.groups[vdom][group_name].extend(members)
+
+        for key, config in source_address_configs.items():
+            result.address_configs.setdefault(key, config)
+
+        for key, config in source_group_configs.items():
+            result.group_configs.setdefault(key, config)
 
     return result
 
@@ -258,12 +328,6 @@ def resolve_group(
     memo: dict[tuple[str, str], tuple[set[str], set[str], list[list[str]]]],
     trail: tuple[str, ...] = (),
 ) -> tuple[set[str], set[str], list[list[str]]]:
-    """
-    Return:
-      effective leaf members
-      nested groups
-      cycle paths
-    """
     key = (vdom, group_name)
 
     if key in memo:
@@ -337,38 +401,6 @@ def build_recursive_indexes(data: ParsedData):
     return effective_members, nested_groups, cycles_by_group, inherited_index
 
 
-def unique_cycles(
-    cycles_by_group: dict[tuple[str, str], list[list[str]]]
-) -> dict[str, list[list[str]]]:
-    result: dict[str, list[list[str]]] = defaultdict(list)
-    seen: set[tuple[str, tuple[str, ...]]] = set()
-
-    for (vdom, _), cycles in cycles_by_group.items():
-        for cycle in cycles:
-            if len(cycle) < 2:
-                continue
-
-            ring = cycle[:-1]
-            if not ring:
-                continue
-
-            rotations = [
-                tuple(ring[i:] + ring[:i])
-                for i in range(len(ring))
-            ]
-            canonical = min(rotations)
-            key = (vdom, canonical)
-
-            if key not in seen:
-                seen.add(key)
-                result[vdom].append(list(canonical) + [canonical[0]])
-
-    for vdom in result:
-        result[vdom].sort(key=lambda cycle: " -> ".join(cycle).lower())
-
-    return result
-
-
 def format_full_report(data: ParsedData) -> str:
     vdoms = sorted(
         set(data.addresses) | set(data.groups),
@@ -386,7 +418,6 @@ def format_full_report(data: ParsedData) -> str:
     ) = build_recursive_indexes(data)
 
     direct_index = direct_membership_index(data)
-    cycle_map = unique_cycles(cycles_by_group)
 
     lines: list[str] = []
     lines.append(APP_NAME)
@@ -452,7 +483,11 @@ def format_full_report(data: ParsedData) -> str:
                 duplicate_entries = sum(
                     count - 1 for count in counts.values() if count > 1
                 )
-                cycle_flag = "Yes" if cycles_by_group.get((vdom, group_name)) else "No"
+                cycle_flag = (
+                    "Yes"
+                    if cycles_by_group.get((vdom, group_name))
+                    else "No"
+                )
 
                 lines.append(
                     f"{group_name:<52}"
@@ -465,56 +500,6 @@ def format_full_report(data: ParsedData) -> str:
 
     lines.append("")
     lines.append("=" * 110)
-    lines.append("DUPLICATE MEMBERS WITHIN THE SAME GROUP")
-    lines.append("=" * 110)
-
-    duplicate_found = False
-
-    for vdom in sorted(data.groups, key=str.lower):
-        for group_name in sorted(data.groups[vdom], key=str.lower):
-            duplicate_members = {
-                member: count
-                for member, count in Counter(
-                    data.groups[vdom][group_name]
-                ).items()
-                if count > 1
-            }
-
-            if not duplicate_members:
-                continue
-
-            duplicate_found = True
-            lines.append("")
-            lines.append(f"VDOM: {vdom}")
-            lines.append(f"Group: {group_name}")
-
-            for member, count in sorted(
-                duplicate_members.items(),
-                key=lambda item: item[0].lower(),
-            ):
-                lines.append(f"  {member} — appears {count} times")
-
-    if not duplicate_found:
-        lines.append("")
-        lines.append("No duplicate direct members were found within any group.")
-
-    lines.append("")
-    lines.append("=" * 110)
-    lines.append("CIRCULAR NESTED-GROUP REFERENCES")
-    lines.append("=" * 110)
-
-    if not cycle_map:
-        lines.append("")
-        lines.append("No circular nested-group references were found.")
-    else:
-        for vdom in sorted(cycle_map, key=str.lower):
-            lines.append("")
-            lines.append(f"VDOM: {vdom}")
-            for cycle in cycle_map[vdom]:
-                lines.append("  " + " -> ".join(cycle))
-
-    lines.append("")
-    lines.append("=" * 110)
     lines.append("OBJECTS USED IN MULTIPLE GROUPS")
     lines.append("=" * 110)
 
@@ -524,13 +509,15 @@ def format_full_report(data: ParsedData) -> str:
     for key in all_objects:
         direct_groups = direct_index.get(key, [])
         all_groups = inherited_index.get(key, [])
+
         if len(all_groups) > 1:
             reused.append((key[0], key[1], direct_groups, all_groups))
 
     if not reused:
         lines.append("")
         lines.append(
-            "No object was found in multiple effective address groups within the same VDOM."
+            "No object was found in multiple effective address groups "
+            "within the same VDOM."
         )
     else:
         lines.append("")
@@ -562,22 +549,13 @@ def format_full_report(data: ParsedData) -> str:
     lines.append("NOTES")
     lines.append("=" * 110)
     lines.append(
-        "• Direct = unique members explicitly configured in the group."
+        "• Use the filter to search for an address object or address group."
     )
     lines.append(
-        "• Nested = nested address groups referenced directly or recursively."
-    )
-    lines.append(
-        "• Effective = unique leaf members after recursively expanding nested groups."
-    )
-    lines.append(
-        "• Circular references are detected and recursion stops safely at the loop."
+        "• Filter results include the object's complete configuration block."
     )
     lines.append(
         "• Address totals count explicit config firewall address entries only."
-    )
-    lines.append(
-        "• Multi-group usage is evaluated separately within each VDOM."
     )
 
     return "\n".join(lines)
@@ -587,80 +565,154 @@ def format_filter_results(data: ParsedData, query: str) -> str:
     query = query.strip()
 
     if not query:
-        return "Enter an address object name or part of a name."
+        return "Enter an address object or address-group name, or part of a name."
 
     query_lower = query.lower()
     direct_index = direct_membership_index(data)
     (
-        _effective_members,
-        _nested_groups,
-        _cycles_by_group,
+        effective_members,
+        nested_groups,
+        cycles_by_group,
         inherited_index,
     ) = build_recursive_indexes(data)
 
-    matches: set[tuple[str, str]] = set()
+    address_matches: set[tuple[str, str]] = set()
+    group_matches: set[tuple[str, str]] = set()
 
     for vdom, objects in data.addresses.items():
         for object_name in objects:
             if query_lower in object_name.lower():
-                matches.add((vdom, object_name))
+                address_matches.add((vdom, object_name))
 
     for (vdom, object_name) in set(direct_index) | set(inherited_index):
         if query_lower in object_name.lower():
-            matches.add((vdom, object_name))
+            address_matches.add((vdom, object_name))
+
+    for vdom, groups in data.groups.items():
+        for group_name in groups:
+            if query_lower in group_name.lower():
+                group_matches.add((vdom, group_name))
 
     lines: list[str] = []
     lines.append(APP_NAME)
     lines.append(f'FILTER: "{query}"')
     lines.append("=" * 100)
 
-    if not matches:
+    total_matches = len(address_matches) + len(group_matches)
+
+    if total_matches == 0:
         lines.append("")
-        lines.append("No matching address object or group member was found.")
+        lines.append("No matching address object or address group was found.")
         return "\n".join(lines)
 
     lines.append("")
-    lines.append(f"Matches: {len(matches):,}")
+    lines.append(
+        f"Matches: {total_matches:,} "
+        f"({len(address_matches):,} address object(s), "
+        f"{len(group_matches):,} address group(s))"
+    )
 
-    for vdom, object_name in sorted(
-        matches,
-        key=lambda item: (item[0].lower(), item[1].lower()),
-    ):
-        direct_groups = direct_index.get((vdom, object_name), [])
-        effective_groups = inherited_index.get((vdom, object_name), [])
-        inherited_only = [
-            group for group in effective_groups if group not in direct_groups
-        ]
-        explicitly_defined = object_name in data.addresses.get(vdom, set())
-
+    if address_matches:
         lines.append("")
-        lines.append(f"VDOM: {vdom}")
-        lines.append(f"Object: {object_name}")
-        lines.append(
-            "Explicit firewall.address object: "
-            + ("Yes" if explicitly_defined else "No / not found in file")
-        )
-        lines.append(f"Direct group membership count: {len(direct_groups):,}")
+        lines.append("=" * 100)
+        lines.append("ADDRESS OBJECT MATCHES")
+        lines.append("=" * 100)
 
-        if direct_groups:
-            for group_name in direct_groups:
-                lines.append(f"  - {group_name}")
-        else:
-            lines.append("  None")
+        for vdom, object_name in sorted(
+            address_matches,
+            key=lambda item: (item[0].lower(), item[1].lower()),
+        ):
+            direct_groups = direct_index.get((vdom, object_name), [])
+            effective_groups = inherited_index.get((vdom, object_name), [])
+            inherited_only = [
+                group for group in effective_groups if group not in direct_groups
+            ]
+            explicitly_defined = object_name in data.addresses.get(vdom, set())
 
-        lines.append(
-            f"Inherited parent-group count: {len(inherited_only):,}"
-        )
+            lines.append("")
+            lines.append(f"VDOM: {vdom}")
+            lines.append(f"Object: {object_name}")
+            lines.append(
+                "Explicit firewall.address object: "
+                + ("Yes" if explicitly_defined else "No / not found in file")
+            )
+            lines.append(f"Direct group membership count: {len(direct_groups):,}")
+            lines.append(
+                "Direct groups: "
+                + (", ".join(direct_groups) if direct_groups else "None")
+            )
+            lines.append(
+                f"Inherited parent-group count: {len(inherited_only):,}"
+            )
+            lines.append(
+                "Inherited parent groups: "
+                + (", ".join(inherited_only) if inherited_only else "None")
+            )
+            lines.append(
+                f"Total effective group memberships: {len(effective_groups):,}"
+            )
+            lines.append("")
+            lines.append("CONFIGURATION:")
+            lines.append("-" * 100)
+            lines.append(
+                data.address_configs.get(
+                    (vdom, object_name),
+                    "Configuration block was not found in the selected file.",
+                )
+            )
 
-        if inherited_only:
-            for group_name in inherited_only:
-                lines.append(f"  - {group_name}")
-        else:
-            lines.append("  None")
+    if group_matches:
+        lines.append("")
+        lines.append("=" * 100)
+        lines.append("ADDRESS GROUP MATCHES")
+        lines.append("=" * 100)
 
-        lines.append(
-            f"Total effective group membership: {len(effective_groups):,}"
-        )
+        for vdom, group_name in sorted(
+            group_matches,
+            key=lambda item: (item[0].lower(), item[1].lower()),
+        ):
+            members = data.groups[vdom][group_name]
+            counts = Counter(members)
+            duplicate_entries = sum(
+                count - 1 for count in counts.values() if count > 1
+            )
+
+            parent_groups = direct_index.get((vdom, group_name), [])
+
+            lines.append("")
+            lines.append(f"VDOM: {vdom}")
+            lines.append(f"Address group: {group_name}")
+            lines.append(f"Direct unique members: {len(counts):,}")
+            lines.append(
+                f"Nested groups: "
+                f"{len(nested_groups.get((vdom, group_name), set())):,}"
+            )
+            lines.append(
+                f"Effective leaf addresses: "
+                f"{len(effective_members.get((vdom, group_name), set())):,}"
+            )
+            lines.append(f"Duplicate direct entries: {duplicate_entries:,}")
+            lines.append(
+                "Circular reference: "
+                + (
+                    "Yes"
+                    if cycles_by_group.get((vdom, group_name))
+                    else "No"
+                )
+            )
+            lines.append(
+                "Direct parent groups: "
+                + (", ".join(parent_groups) if parent_groups else "None")
+            )
+            lines.append("")
+            lines.append("CONFIGURATION:")
+            lines.append("-" * 100)
+            lines.append(
+                data.group_configs.get(
+                    (vdom, group_name),
+                    "Configuration block was not found in the selected file.",
+                )
+            )
 
     return "\n".join(lines)
 
@@ -695,7 +747,10 @@ class AnalyzerApp:
 
         filter_frame = tk.LabelFrame(
             root,
-            text="Filter address object and show direct/inherited group membership",
+            text=(
+                "Search address object or address group "
+                "and show usage plus configuration"
+            ),
             padx=10,
             pady=8,
         )
@@ -713,14 +768,14 @@ class AnalyzerApp:
 
         tk.Button(
             filter_frame,
-            text="Filter",
+            text="Search",
             command=self.apply_filter,
             padx=14,
         ).pack(side="left", padx=(8, 0))
 
         tk.Button(
             filter_frame,
-            text="Clear Filter",
+            text="Clear Search",
             command=self.clear_filter,
             padx=14,
         ).pack(side="left", padx=(8, 0))
