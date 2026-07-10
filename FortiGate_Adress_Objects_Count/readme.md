@@ -44,10 +44,10 @@ sudo apt install python3-tk
 
 ## Download
 
-Place the following script in a folder of your choice:
+Place the following script in the folder:
 
 ```text
-fortigate_address_group_analyzer_v3.py
+fortigate_address_counter.py
 ```
 
 ## Run the Tool
