@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FortiGate Address and Address Group Analyzer v6
+FortiGate Address and Address Group Analyzer
 by Farhan Ahmed | www.farhan.ch
 
 Improved UI:
@@ -26,7 +26,7 @@ from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 
-APP_NAME = "FortiGate Address Group Analyzer v6"
+APP_NAME = "FortiGate Address Group Analyzer"
 
 CONFIG_RE = re.compile(r"^\s*config\s+(.+?)\s*$", re.IGNORECASE)
 EDIT_RE = re.compile(r'^\s*edit\s+(?:"([^"]*)"|(\S+))\s*$', re.IGNORECASE)
