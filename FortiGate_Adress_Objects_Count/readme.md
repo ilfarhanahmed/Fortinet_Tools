@@ -161,11 +161,6 @@ Address objects and address-group memberships are evaluated separately for each 
 
 The same object name in two different VDOMs is treated as two separate objects.
 
-### Nested Address Groups
-
-If an address group contains another address group, the nested group name is treated as a member exactly as it appears in the FortiGate configuration.
-
-The tool does not recursively expand nested groups.
 
 ### TAC Report Duplication
 
