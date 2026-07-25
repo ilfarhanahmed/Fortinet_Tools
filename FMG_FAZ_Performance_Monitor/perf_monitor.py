@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 FortiManager-FortiAnalyzer System Performance Monitor
-Boxed ANSI dashboard edition.
-
-The API collection and parsing workflow remains the same as the original
-monitor. The terminal output uses colored boxes and does not display the API key.
 
 Author: Farhan Ahmed - www.farhan.ch
 """
